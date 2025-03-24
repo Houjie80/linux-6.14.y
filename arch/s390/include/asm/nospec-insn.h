@@ -2,8 +2,7 @@
 #ifndef _ASM_S390_NOSPEC_ASM_H
 #define _ASM_S390_NOSPEC_ASM_H
 
-#include <asm/alternative-asm.h>
-#include <asm/asm-offsets.h>
+#include <linux/linkage.h>
 #include <asm/dwarf.h>
 
 #ifdef __ASSEMBLY__
@@ -17,24 +16,25 @@
  */
 	.macro __THUNK_PROLOG_NAME name
 #ifdef CONFIG_EXPOLINE_EXTERN
-	.pushsection .text,"ax",@progbits
-	.align 16,0x07
+	SYM_CODE_START(\name)
 #else
 	.pushsection .text.\name,"axG",@progbits,\name,comdat
-#endif
 	.globl \name
 	.hidden \name
 	.type \name,@function
 \name:
 	CFI_STARTPROC
+#endif
 	.endm
 
 	.macro __THUNK_EPILOG_NAME name
-	CFI_ENDPROC
 #ifdef CONFIG_EXPOLINE_EXTERN
-	.size \name, .-\name
-#endif
+	SYM_CODE_END(\name)
+	EXPORT_SYMBOL(\name)
+#else
+	CFI_ENDPROC
 	.popsection
+#endif
 	.endm
 
 	.macro __THUNK_PROLOG_BR r1
@@ -54,31 +54,31 @@
 	.endm
 
 	.macro	__DECODE_R expand,reg
-	.set __decode_fail,1
+	.set .L__decode_fail,1
 	.irp r1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	.ifc \reg,%r\r1
 	\expand \r1
-	.set __decode_fail,0
+	.set .L__decode_fail,0
 	.endif
 	.endr
-	.if __decode_fail == 1
+	.if .L__decode_fail == 1
 	.error "__DECODE_R failed"
 	.endif
 	.endm
 
 	.macro	__DECODE_RR expand,rsave,rtarget
-	.set __decode_fail,1
+	.set .L__decode_fail,1
 	.irp r1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	.ifc \rsave,%r\r1
 	.irp r2,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	.ifc \rtarget,%r\r2
 	\expand \r1,\r2
-	.set __decode_fail,0
+	.set .L__decode_fail,0
 	.endif
 	.endr
 	.endif
 	.endr
-	.if __decode_fail == 1
+	.if .L__decode_fail == 1
 	.error "__DECODE_RR failed"
 	.endif
 	.endm

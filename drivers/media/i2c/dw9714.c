@@ -157,6 +157,8 @@ static int dw9714_probe(struct i2c_client *client)
 		return rval;
 	}
 
+	usleep_range(1000, 2000);
+
 	v4l2_i2c_subdev_init(&dw9714_dev->sd, client, &dw9714_ops);
 	dw9714_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
 				V4L2_SUBDEV_FL_HAS_EVENTS;
@@ -183,13 +185,14 @@ static int dw9714_probe(struct i2c_client *client)
 	return 0;
 
 err_cleanup:
+	regulator_disable(dw9714_dev->vcc);
 	v4l2_ctrl_handler_free(&dw9714_dev->ctrls_vcm);
 	media_entity_cleanup(&dw9714_dev->sd.entity);
 
 	return rval;
 }
 
-static int dw9714_remove(struct i2c_client *client)
+static void dw9714_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9714_device *dw9714_dev = sd_to_dw9714_vcm(sd);
@@ -201,13 +204,10 @@ static int dw9714_remove(struct i2c_client *client)
 		if (ret) {
 			dev_err(&client->dev,
 				"Failed to disable vcc: %d\n", ret);
-			return ret;
 		}
 	}
 	pm_runtime_set_suspended(&client->dev);
 	dw9714_subdev_cleanup(dw9714_dev);
-
-	return 0;
 }
 
 /*
@@ -279,8 +279,8 @@ static int  __maybe_unused dw9714_vcm_resume(struct device *dev)
 }
 
 static const struct i2c_device_id dw9714_id_table[] = {
-	{ DW9714_NAME, 0 },
-	{ { 0 } }
+	{ DW9714_NAME },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, dw9714_id_table);
 
@@ -301,7 +301,7 @@ static struct i2c_driver dw9714_i2c_driver = {
 		.pm = &dw9714_pm_ops,
 		.of_match_table = dw9714_of_table,
 	},
-	.probe_new = dw9714_probe,
+	.probe = dw9714_probe,
 	.remove = dw9714_remove,
 	.id_table = dw9714_id_table,
 };
@@ -310,8 +310,8 @@ module_i2c_driver(dw9714_i2c_driver);
 
 MODULE_AUTHOR("Tianshu Qiu <tian.shu.qiu@intel.com>");
 MODULE_AUTHOR("Jian Xu Zheng");
-MODULE_AUTHOR("Yuning Pu <yuning.pu@intel.com>");
-MODULE_AUTHOR("Jouni Ukkonen <jouni.ukkonen@intel.com>");
-MODULE_AUTHOR("Tommi Franttila <tommi.franttila@intel.com>");
+MODULE_AUTHOR("Yuning Pu");
+MODULE_AUTHOR("Jouni Ukkonen");
+MODULE_AUTHOR("Tommi Franttila");
 MODULE_DESCRIPTION("DW9714 VCM driver");
 MODULE_LICENSE("GPL v2");

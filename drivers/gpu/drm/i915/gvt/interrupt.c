@@ -29,10 +29,28 @@
  *
  */
 
+#include <linux/eventfd.h>
+
 #include "i915_drv.h"
 #include "i915_reg.h"
 #include "gvt.h"
 #include "trace.h"
+
+struct intel_gvt_irq_info {
+	char *name;
+	i915_reg_t reg_base;
+	enum intel_gvt_event_type bit_to_event[INTEL_GVT_IRQ_BITWIDTH];
+	int group;
+	DECLARE_BITMAP(downstream_irq_bitmap, INTEL_GVT_IRQ_BITWIDTH);
+	bool has_upstream_irq;
+};
+
+struct intel_gvt_irq_map {
+	int up_irq_group;
+	int up_irq_bit;
+	int down_irq_group;
+	u32 down_irq_bitmask;
+};
 
 /* common offset among interrupt control registers */
 #define regbase_to_isr(base)	(base)
@@ -397,9 +415,44 @@ static void init_irq_map(struct intel_gvt_irq *irq)
 }
 
 /* =======================vEvent injection===================== */
-static int inject_virtual_interrupt(struct intel_vgpu *vgpu)
+
+#define MSI_CAP_CONTROL(offset) (offset + 2)
+#define MSI_CAP_ADDRESS(offset) (offset + 4)
+#define MSI_CAP_DATA(offset) (offset + 8)
+#define MSI_CAP_EN 0x1
+
+static void inject_virtual_interrupt(struct intel_vgpu *vgpu)
 {
-	return intel_gvt_hypervisor_inject_msi(vgpu);
+	unsigned long offset = vgpu->gvt->device_info.msi_cap_offset;
+	u16 control, data;
+	u32 addr;
+
+	control = *(u16 *)(vgpu_cfg_space(vgpu) + MSI_CAP_CONTROL(offset));
+	addr = *(u32 *)(vgpu_cfg_space(vgpu) + MSI_CAP_ADDRESS(offset));
+	data = *(u16 *)(vgpu_cfg_space(vgpu) + MSI_CAP_DATA(offset));
+
+	/* Do not generate MSI if MSIEN is disabled */
+	if (!(control & MSI_CAP_EN))
+		return;
+
+	if (WARN(control & GENMASK(15, 1), "only support one MSI format\n"))
+		return;
+
+	trace_inject_msi(vgpu->id, addr, data);
+
+	/*
+	 * When guest is powered off, msi_trigger is set to NULL, but vgpu's
+	 * config and mmio register isn't restored to default during guest
+	 * poweroff. If this vgpu is still used in next vm, this vgpu's pipe
+	 * may be enabled, then once this vgpu is active, it will get inject
+	 * vblank interrupt request. But msi_trigger is null until msi is
+	 * enabled by guest. so if msi_trigger is null, success is still
+	 * returned and don't inject interrupt into guest.
+	 */
+	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+		return;
+	if (vgpu->msi_trigger)
+		eventfd_signal(vgpu->msi_trigger);
 }
 
 static void propagate_event(struct intel_gvt_irq *irq,

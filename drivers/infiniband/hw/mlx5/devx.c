@@ -27,6 +27,19 @@ enum devx_obj_flags {
 	DEVX_OBJ_FLAGS_INDIRECT_MKEY = 1 << 0,
 	DEVX_OBJ_FLAGS_DCT = 1 << 1,
 	DEVX_OBJ_FLAGS_CQ = 1 << 2,
+	DEVX_OBJ_FLAGS_HW_FREED = 1 << 3,
+};
+
+#define MAX_ASYNC_CMDS 8
+
+struct mlx5_async_cmd {
+	struct ib_uobject *uobject;
+	void *in;
+	int in_size;
+	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
+	int err;
+	struct mlx5_async_work cb_work;
+	struct completion comp;
 };
 
 struct devx_async_data {
@@ -666,7 +679,21 @@ static bool devx_is_valid_obj_id(struct uverbs_attr_bundle *attrs,
 				      obj_id;
 
 	case MLX5_IB_OBJECT_DEVX_OBJ:
-		return ((struct devx_obj *)uobj->object)->obj_id == obj_id;
+	{
+		u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
+		struct devx_obj *devx_uobj = uobj->object;
+
+		if (opcode == MLX5_CMD_OP_QUERY_FLOW_COUNTER &&
+		    devx_uobj->flow_counter_bulk_size) {
+			u64 end;
+
+			end = devx_uobj->obj_id +
+				devx_uobj->flow_counter_bulk_size;
+			return devx_uobj->obj_id <= obj_id && end > obj_id;
+		}
+
+		return devx_uobj->obj_id == obj_id;
+	}
 
 	default:
 		return false;
@@ -907,6 +934,7 @@ static bool devx_is_whitelist_cmd(void *in)
 	case MLX5_CMD_OP_QUERY_HCA_CAP:
 	case MLX5_CMD_OP_QUERY_HCA_VPORT_CONTEXT:
 	case MLX5_CMD_OP_QUERY_ESW_VPORT_CONTEXT:
+	case MLX5_CMD_OP_QUERY_ESW_FUNCTIONS:
 		return true;
 	default:
 		return false;
@@ -962,6 +990,7 @@ static bool devx_is_general_cmd(void *in, struct mlx5_ib_dev *dev)
 	case MLX5_CMD_OP_QUERY_CONG_PARAMS:
 	case MLX5_CMD_OP_QUERY_CONG_STATISTICS:
 	case MLX5_CMD_OP_QUERY_LAG:
+	case MLX5_CMD_OP_QUERY_ESW_FUNCTIONS:
 		return true;
 	default:
 		return false;
@@ -986,7 +1015,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_QUERY_EQN)(
 		return PTR_ERR(c);
 	dev = to_mdev(c->ibucontext.device);
 
-	err = mlx5_vector2eqn(dev->mdev, user_vector, &dev_eqn);
+	err = mlx5_comp_eqn_get(dev->mdev, user_vector, &dev_eqn);
 	if (err < 0)
 		return err;
 
@@ -1389,7 +1418,9 @@ static int devx_obj_cleanup(struct ib_uobject *uobject,
 		 */
 		mlx5r_deref_wait_odp_mkey(&obj->mkey);
 
-	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
+	if (obj->flags & DEVX_OBJ_FLAGS_HW_FREED)
+		ret = 0;
+	else if (obj->flags & DEVX_OBJ_FLAGS_DCT)
 		ret = mlx5_core_destroy_dct(obj->ib_dev, &obj->core_dct);
 	else if (obj->flags & DEVX_OBJ_FLAGS_CQ)
 		ret = mlx5_core_destroy_cq(obj->ib_dev->mdev, &obj->core_cq);
@@ -1515,10 +1546,17 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_OBJ_CREATE)(
 		goto obj_free;
 
 	if (opcode == MLX5_CMD_OP_ALLOC_FLOW_COUNTER) {
-		u8 bulk = MLX5_GET(alloc_flow_counter_in,
-				   cmd_in,
-				   flow_counter_bulk);
-		obj->flow_counter_bulk_size = 128UL * bulk;
+		u32 bulk = MLX5_GET(alloc_flow_counter_in,
+				    cmd_in,
+				    flow_counter_bulk_log_size);
+
+		if (bulk)
+			bulk = 1 << bulk;
+		else
+			bulk = 128UL * MLX5_GET(alloc_flow_counter_in,
+						cmd_in,
+						flow_counter_bulk);
+		obj->flow_counter_bulk_size = bulk;
 	}
 
 	uobj->object = obj;
@@ -1991,7 +2029,6 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_SUBSCRIBE_EVENT)(
 	int redirect_fd;
 	bool use_eventfd = false;
 	int num_events;
-	int num_alloc_xa_entries = 0;
 	u16 obj_type = 0;
 	u64 cookie = 0;
 	u32 obj_id = 0;
@@ -2073,7 +2110,6 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_SUBSCRIBE_EVENT)(
 		if (err)
 			goto err;
 
-		num_alloc_xa_entries++;
 		event_sub = kzalloc(sizeof(*event_sub), GFP_KERNEL);
 		if (!event_sub) {
 			err = -ENOMEM;
@@ -2158,32 +2194,39 @@ err:
 
 static int devx_umem_get(struct mlx5_ib_dev *dev, struct ib_ucontext *ucontext,
 			 struct uverbs_attr_bundle *attrs,
-			 struct devx_umem *obj)
+			 struct devx_umem *obj, u32 access_flags)
 {
 	u64 addr;
 	size_t size;
-	u32 access;
 	int err;
 
 	if (uverbs_copy_from(&addr, attrs, MLX5_IB_ATTR_DEVX_UMEM_REG_ADDR) ||
 	    uverbs_copy_from(&size, attrs, MLX5_IB_ATTR_DEVX_UMEM_REG_LEN))
 		return -EFAULT;
 
-	err = uverbs_get_flags32(&access, attrs,
-				 MLX5_IB_ATTR_DEVX_UMEM_REG_ACCESS,
-				 IB_ACCESS_LOCAL_WRITE |
-				 IB_ACCESS_REMOTE_WRITE |
-				 IB_ACCESS_REMOTE_READ);
+	err = ib_check_mr_access(&dev->ib_dev, access_flags);
 	if (err)
 		return err;
 
-	err = ib_check_mr_access(&dev->ib_dev, access);
-	if (err)
-		return err;
+	if (uverbs_attr_is_valid(attrs, MLX5_IB_ATTR_DEVX_UMEM_REG_DMABUF_FD)) {
+		struct ib_umem_dmabuf *umem_dmabuf;
+		int dmabuf_fd;
 
-	obj->umem = ib_umem_get(&dev->ib_dev, addr, size, access);
-	if (IS_ERR(obj->umem))
-		return PTR_ERR(obj->umem);
+		err = uverbs_get_raw_fd(&dmabuf_fd, attrs,
+					MLX5_IB_ATTR_DEVX_UMEM_REG_DMABUF_FD);
+		if (err)
+			return -EFAULT;
+
+		umem_dmabuf = ib_umem_dmabuf_get_pinned(
+			&dev->ib_dev, addr, size, dmabuf_fd, access_flags);
+		if (IS_ERR(umem_dmabuf))
+			return PTR_ERR(umem_dmabuf);
+		obj->umem = &umem_dmabuf->umem;
+	} else {
+		obj->umem = ib_umem_get(&dev->ib_dev, addr, size, access_flags);
+		if (IS_ERR(obj->umem))
+			return PTR_ERR(obj->umem);
+	}
 	return 0;
 }
 
@@ -2222,7 +2265,8 @@ static unsigned int devx_umem_find_best_pgsize(struct ib_umem *umem,
 static int devx_umem_reg_cmd_alloc(struct mlx5_ib_dev *dev,
 				   struct uverbs_attr_bundle *attrs,
 				   struct devx_umem *obj,
-				   struct devx_umem_reg_cmd *cmd)
+				   struct devx_umem_reg_cmd *cmd,
+				   int access)
 {
 	unsigned long pgsz_bitmap;
 	unsigned int page_size;
@@ -2271,6 +2315,9 @@ static int devx_umem_reg_cmd_alloc(struct mlx5_ib_dev *dev,
 	MLX5_SET(umem, umem, page_offset,
 		 ib_umem_dma_offset(obj->umem, page_size));
 
+	if (mlx5_umem_needs_ats(dev, obj->umem, access))
+		MLX5_SET(umem, umem, ats, 1);
+
 	mlx5_ib_populate_pas(obj->umem, page_size, mtt,
 			     (obj->umem->writable ? MLX5_IB_MTT_WRITE : 0) |
 				     MLX5_IB_MTT_READ);
@@ -2288,20 +2335,30 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_UMEM_REG)(
 	struct mlx5_ib_ucontext *c = rdma_udata_to_drv_context(
 		&attrs->driver_udata, struct mlx5_ib_ucontext, ibucontext);
 	struct mlx5_ib_dev *dev = to_mdev(c->ibucontext.device);
+	int access_flags;
 	int err;
 
 	if (!c->devx_uid)
 		return -EINVAL;
 
+	err = uverbs_get_flags32(&access_flags, attrs,
+				 MLX5_IB_ATTR_DEVX_UMEM_REG_ACCESS,
+				 IB_ACCESS_LOCAL_WRITE |
+				 IB_ACCESS_REMOTE_WRITE |
+				 IB_ACCESS_REMOTE_READ |
+				 IB_ACCESS_RELAXED_ORDERING);
+	if (err)
+		return err;
+
 	obj = kzalloc(sizeof(struct devx_umem), GFP_KERNEL);
 	if (!obj)
 		return -ENOMEM;
 
-	err = devx_umem_get(dev, &c->ibucontext, attrs, obj);
+	err = devx_umem_get(dev, &c->ibucontext, attrs, obj, access_flags);
 	if (err)
 		goto err_obj_free;
 
-	err = devx_umem_reg_cmd_alloc(dev, attrs, obj, &cmd);
+	err = devx_umem_reg_cmd_alloc(dev, attrs, obj, &cmd, access_flags);
 	if (err)
 		goto err_umem_release;
 
@@ -2456,7 +2513,7 @@ static void dispatch_event_fd(struct list_head *fd_list,
 
 	list_for_each_entry_rcu(item, fd_list, xa_list) {
 		if (item->eventfd)
-			eventfd_signal(item->eventfd, 1);
+			eventfd_signal(item->eventfd);
 		else
 			deliver_event(item, data);
 	}
@@ -2553,6 +2610,82 @@ void mlx5_ib_devx_cleanup(struct mlx5_ib_dev *dev)
 	}
 }
 
+static void devx_async_destroy_cb(int status, struct mlx5_async_work *context)
+{
+	struct mlx5_async_cmd *devx_out = container_of(context,
+					  struct mlx5_async_cmd, cb_work);
+	struct devx_obj *obj = devx_out->uobject->object;
+
+	if (!status)
+		obj->flags |= DEVX_OBJ_FLAGS_HW_FREED;
+
+	complete(&devx_out->comp);
+}
+
+static void devx_async_destroy(struct mlx5_ib_dev *dev,
+			       struct mlx5_async_cmd *cmd)
+{
+	init_completion(&cmd->comp);
+	cmd->err = mlx5_cmd_exec_cb(&dev->async_ctx, cmd->in, cmd->in_size,
+				    &cmd->out, sizeof(cmd->out),
+				    devx_async_destroy_cb, &cmd->cb_work);
+}
+
+static void devx_wait_async_destroy(struct mlx5_async_cmd *cmd)
+{
+	if (!cmd->err)
+		wait_for_completion(&cmd->comp);
+	atomic_set(&cmd->uobject->usecnt, 0);
+}
+
+void mlx5_ib_ufile_hw_cleanup(struct ib_uverbs_file *ufile)
+{
+	struct mlx5_async_cmd async_cmd[MAX_ASYNC_CMDS];
+	struct ib_ucontext *ucontext = ufile->ucontext;
+	struct ib_device *device = ucontext->device;
+	struct mlx5_ib_dev *dev = to_mdev(device);
+	struct ib_uobject *uobject;
+	struct devx_obj *obj;
+	int head = 0;
+	int tail = 0;
+
+	list_for_each_entry(uobject, &ufile->uobjects, list) {
+		WARN_ON(uverbs_try_lock_object(uobject, UVERBS_LOOKUP_WRITE));
+
+		/*
+		 * Currently we only support QP destruction, if other objects
+		 * are to be destroyed need to add type synchronization to the
+		 * cleanup algorithm and handle pre/post FW cleanup for the
+		 * new types if needed.
+		 */
+		if (uobj_get_object_id(uobject) != MLX5_IB_OBJECT_DEVX_OBJ ||
+		    (get_dec_obj_type(uobject->object, MLX5_EVENT_TYPE_MAX) !=
+		     MLX5_OBJ_TYPE_QP)) {
+			atomic_set(&uobject->usecnt, 0);
+			continue;
+		}
+
+		obj = uobject->object;
+
+		async_cmd[tail % MAX_ASYNC_CMDS].in = obj->dinbox;
+		async_cmd[tail % MAX_ASYNC_CMDS].in_size = obj->dinlen;
+		async_cmd[tail % MAX_ASYNC_CMDS].uobject = uobject;
+
+		devx_async_destroy(dev, &async_cmd[tail % MAX_ASYNC_CMDS]);
+		tail++;
+
+		if (tail - head == MAX_ASYNC_CMDS) {
+			devx_wait_async_destroy(&async_cmd[head % MAX_ASYNC_CMDS]);
+			head++;
+		}
+	}
+
+	while (head != tail) {
+		devx_wait_async_destroy(&async_cmd[head % MAX_ASYNC_CMDS]);
+		head++;
+	}
+}
+
 static ssize_t devx_async_cmd_event_read(struct file *filp, char __user *buf,
 					 size_t count, loff_t *pos)
 {
@@ -2631,7 +2764,6 @@ static const struct file_operations devx_async_cmd_event_fops = {
 	.read	 = devx_async_cmd_event_read,
 	.poll    = devx_async_cmd_event_poll,
 	.release = uverbs_uobject_fd_release,
-	.llseek	 = no_llseek,
 };
 
 static ssize_t devx_async_event_read(struct file *filp, char __user *buf,
@@ -2746,7 +2878,6 @@ static const struct file_operations devx_async_event_fops = {
 	.read	 = devx_async_event_read,
 	.poll    = devx_async_event_poll,
 	.release = uverbs_uobject_fd_release,
-	.llseek	 = no_llseek,
 };
 
 static void devx_async_cmd_event_destroy_uobj(struct ib_uobject *uobj,
@@ -2833,6 +2964,8 @@ DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_ATTR_PTR_IN(MLX5_IB_ATTR_DEVX_UMEM_REG_LEN,
 			   UVERBS_ATTR_TYPE(u64),
 			   UA_MANDATORY),
+	UVERBS_ATTR_RAW_FD(MLX5_IB_ATTR_DEVX_UMEM_REG_DMABUF_FD,
+			   UA_OPTIONAL),
 	UVERBS_ATTR_FLAGS_IN(MLX5_IB_ATTR_DEVX_UMEM_REG_ACCESS,
 			     enum ib_access_flags),
 	UVERBS_ATTR_CONST_IN(MLX5_IB_ATTR_DEVX_UMEM_REG_PGSZ_BITMAP,
@@ -2905,7 +3038,7 @@ DECLARE_UVERBS_NAMED_METHOD(
 	MLX5_IB_METHOD_DEVX_OBJ_MODIFY,
 	UVERBS_ATTR_IDR(MLX5_IB_ATTR_DEVX_OBJ_MODIFY_HANDLE,
 			UVERBS_IDR_ANY_OBJECT,
-			UVERBS_ACCESS_WRITE,
+			UVERBS_ACCESS_READ,
 			UA_MANDATORY),
 	UVERBS_ATTR_PTR_IN(
 		MLX5_IB_ATTR_DEVX_OBJ_MODIFY_CMD_IN,

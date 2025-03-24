@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2022 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2024 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -93,7 +93,6 @@ static void lpfc_vmid_put_cs_ctl(struct lpfc_vport *vport, u32 ctcl_vmid);
 int
 lpfc_els_chk_latt(struct lpfc_vport *vport)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba  *phba = vport->phba;
 	uint32_t ha_copy;
 
@@ -121,14 +120,21 @@ lpfc_els_chk_latt(struct lpfc_vport *vport)
 	 * will cleanup any left over in-progress discovery
 	 * events.
 	 */
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag |= FC_ABORT_DISCOVERY;
-	spin_unlock_irq(shost->host_lock);
+	set_bit(FC_ABORT_DISCOVERY, &vport->fc_flag);
 
 	if (phba->link_state != LPFC_CLEAR_LA)
 		lpfc_issue_clear_la(phba, vport);
 
 	return 1;
+}
+
+static bool lpfc_is_els_acc_rsp(struct lpfc_dmabuf *buf)
+{
+	struct fc_els_ls_acc *rsp = buf->virt;
+
+	if (rsp && rsp->la_cmd == ELS_LS_ACC)
+		return true;
+	return false;
 }
 
 /**
@@ -152,7 +158,7 @@ lpfc_els_chk_latt(struct lpfc_vport *vport)
  * Buffer Descriptor Entries (BDEs), allocates buffers for both command
  * payload and response payload (if expected). The reference count on the
  * ndlp is incremented by 1 and the reference to the ndlp is put into
- * context1 of the IOCB data structure for this IOCB to hold the ndlp
+ * ndlp of the IOCB data structure for this IOCB to hold the ndlp
  * reference for the command's callback function to access later.
  *
  * Return code
@@ -183,11 +189,11 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, u8 expect_rsp,
 	 * If this command is for fabric controller and HBA running
 	 * in FIP mode send FLOGI, FDISC and LOGO as FIP frames.
 	 */
-	if ((did == Fabric_DID) &&
-	    (phba->hba_flag & HBA_FIP_SUPPORT) &&
-	    ((elscmd == ELS_CMD_FLOGI) ||
-	     (elscmd == ELS_CMD_FDISC) ||
-	     (elscmd == ELS_CMD_LOGO)))
+	if (did == Fabric_DID &&
+	    test_bit(HBA_FIP_SUPPORT, &phba->hba_flag) &&
+	    (elscmd == ELS_CMD_FLOGI ||
+	     elscmd == ELS_CMD_FDISC ||
+	     elscmd == ELS_CMD_LOGO))
 		switch (elscmd) {
 		case ELS_CMD_FLOGI:
 			elsiocb->cmd_flag |=
@@ -279,8 +285,8 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, u8 expect_rsp,
 		bpl->type_size |= cpu_to_le32(ULP_BDE64_TYPE_BDE_64);
 	}
 
-	elsiocb->context2 = pcmd;
-	elsiocb->context3 = pbuflist;
+	elsiocb->cmd_dmabuf = pcmd;
+	elsiocb->bpl_dmabuf = pbuflist;
 	elsiocb->retry = retry;
 	elsiocb->vport = vport;
 	elsiocb->drvrTimeout = (phba->fc_ratov << 1) + LPFC_DRVR_TIMEOUT;
@@ -292,7 +298,7 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, u8 expect_rsp,
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 				 "0116 Xmit ELS command x%x to remote "
 				 "NPORT x%x I/O tag: x%x, port state:x%x "
-				 "rpi x%x fc_flag:x%x\n",
+				 "rpi x%x fc_flag:x%lx\n",
 				 elscmd, did, elsiocb->iotag,
 				 vport->port_state, ndlp->nlp_rpi,
 				 vport->fc_flag);
@@ -301,7 +307,7 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, u8 expect_rsp,
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 				 "0117 Xmit ELS response x%x to remote "
 				 "NPORT x%x I/O tag: x%x, size: x%x "
-				 "port_state x%x  rpi x%x fc_flag x%x\n",
+				 "port_state x%x  rpi x%x fc_flag x%lx\n",
 				 elscmd, ndlp->nlp_DID, elsiocb->iotag,
 				 cmd_size, vport->port_state,
 				 ndlp->nlp_rpi, vport->fc_flag);
@@ -345,7 +351,6 @@ lpfc_issue_fabric_reglogin(struct lpfc_vport *vport)
 {
 	struct lpfc_hba  *phba = vport->phba;
 	LPFC_MBOXQ_t *mbox;
-	struct lpfc_dmabuf *mp;
 	struct lpfc_nodelist *ndlp;
 	struct serv_parm *sp;
 	int rc;
@@ -395,7 +400,7 @@ lpfc_issue_fabric_reglogin(struct lpfc_vport *vport)
 	mbox->ctx_ndlp = lpfc_nlp_get(ndlp);
 	if (!mbox->ctx_ndlp) {
 		err = 6;
-		goto fail_no_ndlp;
+		goto fail_free_mbox;
 	}
 
 	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT);
@@ -411,13 +416,8 @@ fail_issue_reg_login:
 	 * for the failed mbox command.
 	 */
 	lpfc_nlp_put(ndlp);
-fail_no_ndlp:
-	mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
-	lpfc_mbuf_free(phba, mp->virt, mp->phys);
-	kfree(mp);
 fail_free_mbox:
-	mempool_free(mbox, phba->mbox_mem_pool);
-
+	lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
 fail:
 	lpfc_vport_set_state(vport, FC_VPORT_FAILED);
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
@@ -449,7 +449,7 @@ lpfc_issue_reg_vfi(struct lpfc_vport *vport)
 	/* move forward in case of SLI4 FC port loopback test and pt2pt mode */
 	if ((phba->sli_rev == LPFC_SLI_REV4) &&
 	    !(phba->link_flag & LS_LOOPBACK_MODE) &&
-	    !(vport->fc_flag & FC_PT2PT)) {
+	    !test_bit(FC_PT2PT, &vport->fc_flag)) {
 		ndlp = lpfc_findnode_did(vport, Fabric_DID);
 		if (!ndlp) {
 			rc = -ENODEV;
@@ -464,46 +464,39 @@ lpfc_issue_reg_vfi(struct lpfc_vport *vport)
 	}
 
 	/* Supply CSP's only if we are fabric connect or pt-to-pt connect */
-	if ((vport->fc_flag & FC_FABRIC) || (vport->fc_flag & FC_PT2PT)) {
-		dmabuf = kzalloc(sizeof(struct lpfc_dmabuf), GFP_KERNEL);
-		if (!dmabuf) {
+	if (test_bit(FC_FABRIC, &vport->fc_flag) ||
+	    test_bit(FC_PT2PT, &vport->fc_flag)) {
+		rc = lpfc_mbox_rsrc_prep(phba, mboxq);
+		if (rc) {
 			rc = -ENOMEM;
-			goto fail;
+			goto fail_mbox;
 		}
-		dmabuf->virt = lpfc_mbuf_alloc(phba, MEM_PRI, &dmabuf->phys);
-		if (!dmabuf->virt) {
-			rc = -ENOMEM;
-			goto fail;
-		}
+		dmabuf = mboxq->ctx_buf;
 		memcpy(dmabuf->virt, &phba->fc_fabparam,
 		       sizeof(struct serv_parm));
 	}
 
 	vport->port_state = LPFC_FABRIC_CFG_LINK;
-	if (dmabuf)
+	if (dmabuf) {
 		lpfc_reg_vfi(mboxq, vport, dmabuf->phys);
-	else
+		/* lpfc_reg_vfi memsets the mailbox.  Restore the ctx_buf. */
+		mboxq->ctx_buf = dmabuf;
+	} else {
 		lpfc_reg_vfi(mboxq, vport, 0);
+	}
 
 	mboxq->mbox_cmpl = lpfc_mbx_cmpl_reg_vfi;
 	mboxq->vport = vport;
-	mboxq->ctx_buf = dmabuf;
 	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_NOWAIT);
 	if (rc == MBX_NOT_FINISHED) {
 		rc = -ENXIO;
-		goto fail;
+		goto fail_mbox;
 	}
 	return 0;
 
+fail_mbox:
+	lpfc_mbox_rsrc_cleanup(phba, mboxq, MBOX_THD_UNLOCKED);
 fail:
-	if (mboxq)
-		mempool_free(mboxq, phba->mbox_mem_pool);
-	if (dmabuf) {
-		if (dmabuf->virt)
-			lpfc_mbuf_free(phba, dmabuf->virt, dmabuf->phys);
-		kfree(dmabuf);
-	}
-
 	lpfc_vport_set_state(vport, FC_VPORT_FAILED);
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 			 "0289 Issue Register VFI failed: Err %d\n", rc);
@@ -525,7 +518,6 @@ int
 lpfc_issue_unreg_vfi(struct lpfc_vport *vport)
 {
 	struct lpfc_hba *phba = vport->phba;
-	struct Scsi_Host *shost;
 	LPFC_MBOXQ_t *mboxq;
 	int rc;
 
@@ -551,10 +543,7 @@ lpfc_issue_unreg_vfi(struct lpfc_vport *vport)
 		return -EIO;
 	}
 
-	shost = lpfc_shost_from_vport(vport);
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~FC_VFI_REGISTERED;
-	spin_unlock_irq(shost->host_lock);
+	clear_bit(FC_VFI_REGISTERED, &vport->fc_flag);
 	return 0;
 }
 
@@ -582,7 +571,6 @@ lpfc_check_clean_addr_bit(struct lpfc_vport *vport,
 {
 	struct lpfc_hba *phba = vport->phba;
 	uint8_t fabric_param_changed = 0;
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 
 	if ((vport->fc_prevDID != vport->fc_myDID) ||
 		memcmp(&vport->fabric_portname, &sp->portName,
@@ -604,11 +592,8 @@ lpfc_check_clean_addr_bit(struct lpfc_vport *vport,
 	 * - lpfc_delay_discovery module parameter is set.
 	 */
 	if (fabric_param_changed && !sp->cmn.clean_address_bit &&
-	    (vport->fc_prevDID || phba->cfg_delay_discovery)) {
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_DISC_DELAYED;
-		spin_unlock_irq(shost->host_lock);
-	}
+	    (vport->fc_prevDID || phba->cfg_delay_discovery))
+		set_bit(FC_DISC_DELAYED, &vport->fc_flag);
 
 	return fabric_param_changed;
 }
@@ -638,15 +623,12 @@ static int
 lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 			   struct serv_parm *sp, uint32_t ulp_word4)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba  *phba = vport->phba;
 	struct lpfc_nodelist *np;
 	struct lpfc_nodelist *next_np;
 	uint8_t fabric_param_changed;
 
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag |= FC_FABRIC;
-	spin_unlock_irq(shost->host_lock);
+	set_bit(FC_FABRIC, &vport->fc_flag);
 
 	phba->fc_edtov = be32_to_cpu(sp->cmn.e_d_tov);
 	if (sp->cmn.edtovResolution)	/* E_D_TOV ticks are in nanoseconds */
@@ -655,11 +637,8 @@ lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	phba->fc_edtovResol = sp->cmn.edtovResolution;
 	phba->fc_ratov = (be32_to_cpu(sp->cmn.w2.r_a_tov) + 999) / 1000;
 
-	if (phba->fc_topology == LPFC_TOPOLOGY_LOOP) {
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_PUBLIC_LOOP;
-		spin_unlock_irq(shost->host_lock);
-	}
+	if (phba->fc_topology == LPFC_TOPOLOGY_LOOP)
+		set_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
 
 	vport->fc_myDID = ulp_word4 & Mask_DID;
 	memcpy(&ndlp->nlp_portname, &sp->portName, sizeof(struct lpfc_name));
@@ -733,12 +712,12 @@ lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 			lpfc_unregister_fcf_prep(phba);
 
 		/* This should just update the VFI CSPs*/
-		if (vport->fc_flag & FC_VFI_REGISTERED)
+		if (test_bit(FC_VFI_REGISTERED, &vport->fc_flag))
 			lpfc_issue_reg_vfi(vport);
 	}
 
 	if (fabric_param_changed &&
-		!(vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)) {
+		!test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag)) {
 
 		/* If our NportID changed, we need to ensure all
 		 * remaining NPORTs get unreg_login'ed.
@@ -746,11 +725,9 @@ lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		list_for_each_entry_safe(np, next_np,
 					&vport->fc_nodes, nlp_listp) {
 			if ((np->nlp_state != NLP_STE_NPR_NODE) ||
-				   !(np->nlp_flag & NLP_NPR_ADISC))
+			    !test_bit(NLP_NPR_ADISC, &np->nlp_flag))
 				continue;
-			spin_lock_irq(&np->lock);
-			np->nlp_flag &= ~NLP_NPR_ADISC;
-			spin_unlock_irq(&np->lock);
+			clear_bit(NLP_NPR_ADISC, &np->nlp_flag);
 			lpfc_unreg_rpi(vport, np);
 		}
 		lpfc_cleanup_pending_mbox(vport);
@@ -758,20 +735,16 @@ lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		if (phba->sli_rev == LPFC_SLI_REV4) {
 			lpfc_sli4_unreg_all_rpis(vport);
 			lpfc_mbx_unreg_vpi(vport);
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag |= FC_VPORT_NEEDS_INIT_VPI;
-			spin_unlock_irq(shost->host_lock);
+			set_bit(FC_VPORT_NEEDS_INIT_VPI, &vport->fc_flag);
 		}
 
 		/*
 		 * For SLI3 and SLI4, the VPI needs to be reregistered in
 		 * response to this fabric parameter change event.
 		 */
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
-		spin_unlock_irq(shost->host_lock);
+		set_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 	} else if ((phba->sli_rev == LPFC_SLI_REV4) &&
-		!(vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)) {
+		   !test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag)) {
 			/*
 			 * Driver needs to re-reg VPI in order for f/w
 			 * to update the MAC address.
@@ -784,18 +757,18 @@ lpfc_cmpl_els_flogi_fabric(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (phba->sli_rev < LPFC_SLI_REV4) {
 		lpfc_nlp_set_state(vport, ndlp, NLP_STE_REG_LOGIN_ISSUE);
 		if (phba->sli3_options & LPFC_SLI3_NPIV_ENABLED &&
-		    vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)
+		    test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag))
 			lpfc_register_new_vport(phba, vport, ndlp);
 		else
 			lpfc_issue_fabric_reglogin(vport);
 	} else {
 		ndlp->nlp_type |= NLP_FABRIC;
 		lpfc_nlp_set_state(vport, ndlp, NLP_STE_UNMAPPED_NODE);
-		if ((!(vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)) &&
-			(vport->vpi_state & LPFC_VPI_REGISTERED)) {
+		if ((!test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag)) &&
+		    (vport->vpi_state & LPFC_VPI_REGISTERED)) {
 			lpfc_start_fdiscs(phba);
 			lpfc_do_scr_ns_plogi(phba, vport);
-		} else if (vport->fc_flag & FC_VFI_REGISTERED)
+		} else if (test_bit(FC_VFI_REGISTERED, &vport->fc_flag))
 			lpfc_issue_init_vpi(vport);
 		else {
 			lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
@@ -831,15 +804,13 @@ static int
 lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 			  struct serv_parm *sp)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba  *phba = vport->phba;
 	LPFC_MBOXQ_t *mbox;
 	int rc;
 
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~(FC_FABRIC | FC_PUBLIC_LOOP);
-	vport->fc_flag |= FC_PT2PT;
-	spin_unlock_irq(shost->host_lock);
+	clear_bit(FC_FABRIC, &vport->fc_flag);
+	clear_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
+	set_bit(FC_PT2PT, &vport->fc_flag);
 
 	/* If we are pt2pt with another NPort, force NPIV off! */
 	phba->sli3_options &= ~LPFC_SLI3_NPIV_ENABLED;
@@ -847,10 +818,7 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	/* If physical FC port changed, unreg VFI and ALL VPIs / RPIs */
 	if ((phba->sli_rev == LPFC_SLI_REV4) && phba->fc_topology_changed) {
 		lpfc_unregister_fcf_prep(phba);
-
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag &= ~FC_VFI_REGISTERED;
-		spin_unlock_irq(shost->host_lock);
+		clear_bit(FC_VFI_REGISTERED, &vport->fc_flag);
 		phba->fc_topology_changed = 0;
 	}
 
@@ -859,9 +827,7 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	if (rc >= 0) {
 		/* This side will initiate the PLOGI */
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_PT2PT_PLOGI;
-		spin_unlock_irq(shost->host_lock);
+		set_bit(FC_PT2PT_PLOGI, &vport->fc_flag);
 
 		/*
 		 * N_Port ID cannot be 0, set our Id to LocalID
@@ -896,9 +862,7 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		       sizeof(struct lpfc_name));
 		/* Set state will put ndlp onto node list if not already done */
 		lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-		spin_unlock_irq(&ndlp->lock);
+		set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 
 		mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
 		if (!mbox)
@@ -958,14 +922,14 @@ lpfc_cmpl_els_flogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		    struct lpfc_iocbq *rspiocb)
 {
 	struct lpfc_vport *vport = cmdiocb->vport;
-	struct Scsi_Host  *shost = lpfc_shost_from_vport(vport);
-	struct lpfc_nodelist *ndlp = cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	IOCB_t *irsp;
-	struct lpfc_dmabuf *pcmd = cmdiocb->context2, *prsp;
+	struct lpfc_dmabuf *pcmd = cmdiocb->cmd_dmabuf, *prsp;
 	struct serv_parm *sp;
 	uint16_t fcf_index;
 	int rc;
 	u32 ulp_status, ulp_word4, tmo;
+	bool flogi_in_retry = false;
 
 	/* Check to see if link went down during discovery */
 	if (lpfc_els_chk_latt(vport)) {
@@ -997,7 +961,7 @@ lpfc_cmpl_els_flogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * In case of FIP mode, perform roundrobin FCF failover
 		 * due to new FCF discovery
 		 */
-		if ((phba->hba_flag & HBA_FIP_SUPPORT) &&
+		if (test_bit(HBA_FIP_SUPPORT, &phba->hba_flag) &&
 		    (phba->fcf.fcf_flag & FCF_DISCOVERY)) {
 			if (phba->link_state < LPFC_LINK_UP)
 				goto stop_rr_fcf_flogi;
@@ -1011,7 +975,7 @@ lpfc_cmpl_els_flogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				phba->fcoe_cvl_eventtag_attn =
 					phba->fcoe_cvl_eventtag;
 			lpfc_printf_log(phba, KERN_WARNING, LOG_FIP | LOG_ELS,
-					"2611 FLOGI failed on FCF (x%x), "
+					"2611 FLOGI FCF (x%x), "
 					"status:x%x/x%x, tmo:x%x, perform "
 					"roundrobin FCF failover\n",
 					phba->fcf.current_rec.fcf_indx,
@@ -1029,18 +993,33 @@ stop_rr_fcf_flogi:
 		if (!(ulp_status == IOSTAT_LOCAL_REJECT &&
 		      ((ulp_word4 & IOERR_PARAM_MASK) ==
 					IOERR_LOOP_OPEN_FAILURE)))
-			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-					 "2858 FLOGI failure Status:x%x/x%x TMO"
-					 ":x%x Data x%x x%x\n",
-					 ulp_status, ulp_word4, tmo,
-					 phba->hba_flag, phba->fcf.fcf_flag);
+			lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+				      "2858 FLOGI Status:x%x/x%x TMO"
+				      ":x%x Data x%lx x%x\n",
+				      ulp_status, ulp_word4, tmo,
+				      phba->hba_flag, phba->fcf.fcf_flag);
 
 		/* Check for retry */
-		if (lpfc_els_retry(phba, cmdiocb, rspiocb))
+		if (lpfc_els_retry(phba, cmdiocb, rspiocb)) {
+			/* Address a timing race with dev_loss.  If dev_loss
+			 * is active on this FPort node, put the initial ref
+			 * count back to stop premature node release actions.
+			 */
+			lpfc_check_nlp_post_devloss(vport, ndlp);
+			flogi_in_retry = true;
 			goto out;
+		}
 
-		lpfc_printf_vlog(vport, KERN_WARNING, LOG_TRACE_EVENT,
-				 "0150 FLOGI failure Status:x%x/x%x "
+		/* The FLOGI will not be retried.  If the FPort node is not
+		 * registered with the SCSI transport, remove the initial
+		 * reference to trigger node release.
+		 */
+		if (!test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag) &&
+		    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD))
+			lpfc_nlp_put(ndlp);
+
+		lpfc_printf_vlog(vport, KERN_WARNING, LOG_ELS,
+				 "0150 FLOGI Status:x%x/x%x "
 				 "xri x%x TMO:x%x refcnt %d\n",
 				 ulp_status, ulp_word4, cmdiocb->sli4_xritag,
 				 tmo, kref_read(&ndlp->kref));
@@ -1049,19 +1028,18 @@ stop_rr_fcf_flogi:
 		if (!(ulp_status == IOSTAT_LOCAL_REJECT &&
 		      ((ulp_word4 & IOERR_PARAM_MASK) ==
 					IOERR_LOOP_OPEN_FAILURE))) {
-			/* FLOGI failure */
-			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-					 "0100 FLOGI failure Status:x%x/x%x "
-					 "TMO:x%x\n",
-					 ulp_status, ulp_word4, tmo);
+			/* Warn FLOGI status */
+			lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+				      "0100 FLOGI Status:x%x/x%x "
+				      "TMO:x%x\n",
+				      ulp_status, ulp_word4, tmo);
 			goto flogifail;
 		}
 
 		/* FLOGI failed, so there is no fabric */
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag &= ~(FC_FABRIC | FC_PUBLIC_LOOP |
-				    FC_PT2PT_NO_NVME);
-		spin_unlock_irq(shost->host_lock);
+		clear_bit(FC_FABRIC, &vport->fc_flag);
+		clear_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
+		clear_bit(FC_PT2PT_NO_NVME, &vport->fc_flag);
 
 		/* If private loop, then allow max outstanding els to be
 		 * LPFC_MAX_DISC_THREADS (32). Scanning in the case of no
@@ -1070,15 +1048,14 @@ stop_rr_fcf_flogi:
 		if (phba->alpa_map[0] == 0)
 			vport->cfg_discovery_threads = LPFC_MAX_DISC_THREADS;
 		if ((phba->sli_rev == LPFC_SLI_REV4) &&
-		    (!(vport->fc_flag & FC_VFI_REGISTERED) ||
+		    (!test_bit(FC_VFI_REGISTERED, &vport->fc_flag) ||
 		     (vport->fc_prevDID != vport->fc_myDID) ||
 			phba->fc_topology_changed)) {
-			if (vport->fc_flag & FC_VFI_REGISTERED) {
+			if (test_bit(FC_VFI_REGISTERED, &vport->fc_flag)) {
 				if (phba->fc_topology_changed) {
 					lpfc_unregister_fcf_prep(phba);
-					spin_lock_irq(shost->host_lock);
-					vport->fc_flag &= ~FC_VFI_REGISTERED;
-					spin_unlock_irq(shost->host_lock);
+					clear_bit(FC_VFI_REGISTERED,
+						  &vport->fc_flag);
 					phba->fc_topology_changed = 0;
 				} else {
 					lpfc_sli4_unreg_all_rpis(vport);
@@ -1086,41 +1063,52 @@ stop_rr_fcf_flogi:
 			}
 
 			/* Do not register VFI if the driver aborted FLOGI */
-			if (!lpfc_error_lost_link(ulp_status, ulp_word4))
+			if (!lpfc_error_lost_link(vport, ulp_status, ulp_word4))
 				lpfc_issue_reg_vfi(vport);
 
-			lpfc_nlp_put(ndlp);
 			goto out;
 		}
 		goto flogifail;
 	}
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~FC_VPORT_CVL_RCVD;
-	vport->fc_flag &= ~FC_VPORT_LOGO_RCVD;
-	spin_unlock_irq(shost->host_lock);
+	clear_bit(FC_VPORT_CVL_RCVD, &vport->fc_flag);
+	clear_bit(FC_VPORT_LOGO_RCVD, &vport->fc_flag);
 
 	/*
-	 * The FLogI succeeded.  Sync the data for the CPU before
+	 * The FLOGI succeeded.  Sync the data for the CPU before
 	 * accessing it.
 	 */
 	prsp = list_get_first(&pcmd->list, struct lpfc_dmabuf, list);
 	if (!prsp)
+		goto out;
+	if (!lpfc_is_els_acc_rsp(prsp))
 		goto out;
 	sp = prsp->virt + sizeof(uint32_t);
 
 	/* FLOGI completes successfully */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0101 FLOGI completes successfully, I/O tag:x%x "
-			 "xri x%x Data: x%x x%x x%x x%x x%x x%x x%x %d\n",
+			 "xri x%x Data: x%x x%x x%x x%x x%x x%lx x%x %d\n",
 			 cmdiocb->iotag, cmdiocb->sli4_xritag,
 			 ulp_word4, sp->cmn.e_d_tov,
 			 sp->cmn.w2.r_a_tov, sp->cmn.edtovResolution,
 			 vport->port_state, vport->fc_flag,
 			 sp->cmn.priority_tagging, kref_read(&ndlp->kref));
 
+	/* reinitialize the VMID datastructure before returning */
+	if (lpfc_is_vmid_enabled(phba)) {
+		lpfc_reinit_vmid(vport);
+		vport->vmid_flag = 0;
+	}
 	if (sp->cmn.priority_tagging)
-		vport->vmid_flag |= LPFC_VMID_ISSUE_QFPA;
+		vport->phba->pport->vmid_flag |= (LPFC_VMID_ISSUE_QFPA |
+						  LPFC_VMID_TYPE_PRIO);
 
+	/*
+	 * Address a timing race with dev_loss.  If dev_loss is active on
+	 * this FPort node, put the initial ref count back to stop premature
+	 * node release actions.
+	 */
+	lpfc_check_nlp_post_devloss(vport, ndlp);
 	if (vport->port_state == LPFC_FLOGI) {
 		/*
 		 * If Common Service Parameters indicate Nport
@@ -1129,7 +1117,7 @@ stop_rr_fcf_flogi:
 		if (sp->cmn.fPort)
 			rc = lpfc_cmpl_els_flogi_fabric(vport, ndlp, sp,
 							ulp_word4);
-		else if (!(phba->hba_flag & HBA_FCOE_MODE))
+		else if (!test_bit(HBA_FCOE_MODE, &phba->hba_flag))
 			rc = lpfc_cmpl_els_flogi_nport(vport, ndlp, sp);
 		else {
 			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
@@ -1159,14 +1147,15 @@ stop_rr_fcf_flogi:
 			lpfc_nlp_put(ndlp);
 			spin_lock_irq(&phba->hbalock);
 			phba->fcf.fcf_flag &= ~FCF_DISCOVERY;
-			phba->hba_flag &= ~(FCF_RR_INPROG | HBA_DEVLOSS_TMO);
 			spin_unlock_irq(&phba->hbalock);
+			clear_bit(FCF_RR_INPROG, &phba->hba_flag);
+			clear_bit(HBA_DEVLOSS_TMO, &phba->hba_flag);
 			phba->fcf.fcf_redisc_attempted = 0; /* reset */
 			goto out;
 		}
 		if (!rc) {
 			/* Mark the FCF discovery process done */
-			if (phba->hba_flag & HBA_FIP_SUPPORT)
+			if (test_bit(HBA_FIP_SUPPORT, &phba->hba_flag))
 				lpfc_printf_vlog(vport, KERN_INFO, LOG_FIP |
 						LOG_ELS,
 						"2769 FLOGI to FCF (x%x) "
@@ -1174,13 +1163,14 @@ stop_rr_fcf_flogi:
 						phba->fcf.current_rec.fcf_indx);
 			spin_lock_irq(&phba->hbalock);
 			phba->fcf.fcf_flag &= ~FCF_DISCOVERY;
-			phba->hba_flag &= ~(FCF_RR_INPROG | HBA_DEVLOSS_TMO);
 			spin_unlock_irq(&phba->hbalock);
+			clear_bit(FCF_RR_INPROG, &phba->hba_flag);
+			clear_bit(HBA_DEVLOSS_TMO, &phba->hba_flag);
 			phba->fcf.fcf_redisc_attempted = 0; /* reset */
 			goto out;
 		}
 	} else if (vport->port_state > LPFC_FLOGI &&
-		   vport->fc_flag & FC_PT2PT) {
+		   test_bit(FC_PT2PT, &vport->fc_flag)) {
 		/*
 		 * In a p2p topology, it is possible that discovery has
 		 * already progressed, and this completion can be ignored.
@@ -1195,7 +1185,7 @@ flogifail:
 	phba->fcf.fcf_flag &= ~FCF_DISCOVERY;
 	spin_unlock_irq(&phba->hbalock);
 
-	if (!lpfc_error_lost_link(ulp_status, ulp_word4)) {
+	if (!lpfc_error_lost_link(vport, ulp_status, ulp_word4)) {
 		/* FLOGI failed, so just use loop map to make discovery list */
 		lpfc_disc_list_loopmap(vport);
 
@@ -1211,7 +1201,9 @@ flogifail:
 		lpfc_issue_clear_la(phba, vport);
 	}
 out:
-	phba->hba_flag &= ~HBA_FLOGI_OUTSTANDING;
+	if (!flogi_in_retry)
+		clear_bit(HBA_FLOGI_OUTSTANDING, &phba->hba_flag);
+
 	lpfc_els_free_iocb(phba, cmdiocb);
 	lpfc_nlp_put(ndlp);
 }
@@ -1232,7 +1224,7 @@ lpfc_cmpl_els_link_down(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	uint32_t cmd;
 	u32 ulp_status, ulp_word4;
 
-	pcmd = (uint32_t *)(((struct lpfc_dmabuf *)cmdiocb->context2)->virt);
+	pcmd = (uint32_t *)cmdiocb->cmd_dmabuf->virt;
 	cmd = *pcmd;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
@@ -1240,9 +1232,9 @@ lpfc_cmpl_els_link_down(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_ELS,
 			"6445 ELS completes after LINK_DOWN: "
-			" Status %x/%x cmd x%x flg x%x\n",
+			" Status %x/%x cmd x%x flg x%x iotag x%x\n",
 			ulp_status, ulp_word4, cmd,
-			cmdiocb->cmd_flag);
+			cmdiocb->cmd_flag, cmdiocb->iotag);
 
 	if (cmdiocb->cmd_flag & LPFC_IO_FABRIC) {
 		cmdiocb->cmd_flag &= ~LPFC_IO_FABRIC;
@@ -1265,7 +1257,7 @@ lpfc_cmpl_els_link_down(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
  * out FLOGI ELS command with one outstanding fabric IOCB at a time.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the FLOGI ELS command.
  *
  * Return code
@@ -1295,7 +1287,7 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		return 1;
 
 	wqe = &elsiocb->wqe;
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	icmd = &elsiocb->iocb;
 
 	/* For FLOGI request, remainder of payload is service parameters */
@@ -1318,7 +1310,8 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (phba->cfg_vmid_priority_tagging) {
 		sp->cmn.priority_tagging = 1;
 		/* lpfc_vmid_host_uuid is combination of wwpn and wwnn */
-		if (uuid_is_null((uuid_t *)vport->lpfc_vmid_host_uuid)) {
+		if (!memchr_inv(vport->lpfc_vmid_host_uuid, 0,
+				sizeof(vport->lpfc_vmid_host_uuid))) {
 			memcpy(vport->lpfc_vmid_host_uuid, phba->wwpn,
 			       sizeof(phba->wwpn));
 			memcpy(&vport->lpfc_vmid_host_uuid[8], phba->wwnn,
@@ -1330,7 +1323,7 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		if (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) ==
 		    LPFC_SLI_INTF_IF_TYPE_0) {
 			/* FLOGI needs to be 3 for WQE FCFI */
-			ct = ((SLI4_CT_FCFI >> 1) & 1) | (SLI4_CT_FCFI & 1);
+			ct = SLI4_CT_FCFI;
 			bf_set(wqe_ct, &wqe->els_req.wqe_com, ct);
 
 			/* Set the fcfi to the fcfi we registered with */
@@ -1372,23 +1365,30 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		"Issue FLOGI:     opt:x%x",
 		phba->sli3_options, 0, 0);
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
 
+	/* Avoid race with FLOGI completion and hba_flags. */
+	set_bit(HBA_FLOGI_ISSUED, &phba->hba_flag);
+	set_bit(HBA_FLOGI_OUTSTANDING, &phba->hba_flag);
+
 	rc = lpfc_issue_fabric_iocb(phba, elsiocb);
 	if (rc == IOCB_ERROR) {
+		clear_bit(HBA_FLOGI_ISSUED, &phba->hba_flag);
+		clear_bit(HBA_FLOGI_OUTSTANDING, &phba->hba_flag);
 		lpfc_els_free_iocb(phba, elsiocb);
 		lpfc_nlp_put(ndlp);
 		return 1;
 	}
 
-	phba->hba_flag |= (HBA_FLOGI_ISSUED | HBA_FLOGI_OUTSTANDING);
+	/* Clear external loopback plug detected flag */
+	phba->link_flag &= ~LS_EXTERNAL_LOOPBACK;
 
 	/* Check for a deferred FLOGI ACC condition */
-	if (phba->defer_flogi_acc_flag) {
+	if (phba->defer_flogi_acc.flag) {
 		/* lookup ndlp for received FLOGI */
 		ndlp = lpfc_findnode_did(vport, 0);
 		if (!ndlp)
@@ -1402,34 +1402,38 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		if (phba->sli_rev == LPFC_SLI_REV4) {
 			bf_set(wqe_ctxt_tag,
 			       &defer_flogi_acc.wqe.xmit_els_rsp.wqe_com,
-			       phba->defer_flogi_acc_rx_id);
+			       phba->defer_flogi_acc.rx_id);
 			bf_set(wqe_rcvoxid,
 			       &defer_flogi_acc.wqe.xmit_els_rsp.wqe_com,
-			       phba->defer_flogi_acc_ox_id);
+			       phba->defer_flogi_acc.ox_id);
 		} else {
 			icmd = &defer_flogi_acc.iocb;
-			icmd->ulpContext = phba->defer_flogi_acc_rx_id;
+			icmd->ulpContext = phba->defer_flogi_acc.rx_id;
 			icmd->unsli3.rcvsli3.ox_id =
-				phba->defer_flogi_acc_ox_id;
+				phba->defer_flogi_acc.ox_id;
 		}
 
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 				 "3354 Xmit deferred FLOGI ACC: rx_id: x%x,"
-				 " ox_id: x%x, hba_flag x%x\n",
-				 phba->defer_flogi_acc_rx_id,
-				 phba->defer_flogi_acc_ox_id, phba->hba_flag);
+				 " ox_id: x%x, hba_flag x%lx\n",
+				 phba->defer_flogi_acc.rx_id,
+				 phba->defer_flogi_acc.ox_id, phba->hba_flag);
 
 		/* Send deferred FLOGI ACC */
 		lpfc_els_rsp_acc(vport, ELS_CMD_FLOGI, &defer_flogi_acc,
 				 ndlp, NULL);
 
-		phba->defer_flogi_acc_flag = false;
-		vport->fc_myDID = did;
+		phba->defer_flogi_acc.flag = false;
 
-		/* Decrement ndlp reference count to indicate the node can be
-		 * released when other references are removed.
+		/* Decrement the held ndlp that was incremented when the
+		 * deferred flogi acc flag was set.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (phba->defer_flogi_acc.ndlp) {
+			lpfc_nlp_put(phba->defer_flogi_acc.ndlp);
+			phba->defer_flogi_acc.ndlp = NULL;
+		}
+
+		vport->fc_myDID = did;
 	}
 
 	return 0;
@@ -1474,10 +1478,11 @@ lpfc_els_abort_flogi(struct lpfc_hba *phba)
 	list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list) {
 		ulp_command = get_job_cmnd(phba, iocb);
 		if (ulp_command == CMD_ELS_REQUEST64_CR) {
-			ndlp = (struct lpfc_nodelist *)(iocb->context1);
+			ndlp = iocb->ndlp;
 			if (ndlp && ndlp->nlp_DID == Fabric_DID) {
-				if ((phba->pport->fc_flag & FC_PT2PT) &&
-				    !(phba->pport->fc_flag & FC_PT2PT_PLOGI))
+				if (test_bit(FC_PT2PT, &phba->pport->fc_flag) &&
+				    !test_bit(FC_PT2PT_PLOGI,
+					      &phba->pport->fc_flag))
 					iocb->fabric_cmd_cmpl =
 						lpfc_ignore_els_cmpl;
 				lpfc_sli_issue_abort_iotag(phba, pring, iocb,
@@ -1531,11 +1536,16 @@ lpfc_initial_flogi(struct lpfc_vport *vport)
 		lpfc_enqueue_node(vport, ndlp);
 	}
 
+	/* Reset the Fabric flag, topology change may have happened */
+	clear_bit(FC_FABRIC, &vport->fc_flag);
 	if (lpfc_issue_els_flogi(vport, ndlp, 0)) {
-		/* This decrement of reference count to node shall kick off
-		 * the release of the node.
+		/* A node reference should be retained while registered with a
+		 * transport or dev-loss-evt work is pending.
+		 * Otherwise, decrement node reference to trigger release.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
+		    !test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag))
+			lpfc_nlp_put(ndlp);
 		return 0;
 	}
 	return 1;
@@ -1578,10 +1588,13 @@ lpfc_initial_fdisc(struct lpfc_vport *vport)
 	}
 
 	if (lpfc_issue_els_fdisc(vport, ndlp, 0)) {
-		/* decrement node reference count to trigger the release of
-		 * the node.
+		/* A node reference should be retained while registered with a
+		 * transport or dev-loss-evt work is pending.
+		 * Otherwise, decrement node reference to trigger release.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
+		    !test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag))
+			lpfc_nlp_put(ndlp);
 		return 0;
 	}
 	return 1;
@@ -1607,11 +1620,12 @@ lpfc_more_plogi(struct lpfc_vport *vport)
 	/* Continue discovery with <num_disc_nodes> PLOGIs to go */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 			 "0232 Continue discovery with %d PLOGIs to go "
-			 "Data: x%x x%x x%x\n",
-			 vport->num_disc_nodes, vport->fc_plogi_cnt,
+			 "Data: x%x x%lx x%x\n",
+			 vport->num_disc_nodes,
+			 atomic_read(&vport->fc_plogi_cnt),
 			 vport->fc_flag, vport->port_state);
 	/* Check to see if there are more PLOGIs to be sent */
-	if (vport->fc_flag & FC_NLP_MORE)
+	if (test_bit(FC_NLP_MORE, &vport->fc_flag))
 		/* go thru NPR nodes and issue any remaining ELS PLOGIs */
 		lpfc_els_disc_plogi(vport);
 
@@ -1657,18 +1671,13 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 	struct lpfc_nodelist *new_ndlp;
 	struct serv_parm *sp;
 	uint8_t  name[sizeof(struct lpfc_name)];
-	uint32_t keepDID = 0, keep_nlp_flag = 0;
-	uint32_t keep_new_nlp_flag = 0;
+	uint32_t keepDID = 0;
+	int rc;
+	unsigned long keep_nlp_flag = 0, keep_new_nlp_flag = 0;
 	uint16_t keep_nlp_state;
 	u32 keep_nlp_fc4_type = 0;
 	struct lpfc_nvme_rport *keep_nrport = NULL;
 	unsigned long *active_rrqs_xri_bitmap = NULL;
-
-	/* Fabric nodes can have the same WWPN so we don't bother searching
-	 * by WWPN.  Just return the ndlp that was given to us.
-	 */
-	if (ndlp->nlp_type & NLP_FABRIC)
-		return ndlp;
 
 	sp = (struct serv_parm *) ((uint8_t *) prsp + sizeof(uint32_t));
 	memset(name, 0, sizeof(struct lpfc_name));
@@ -1679,14 +1688,8 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 	new_ndlp = lpfc_findnode_wwpn(vport, &sp->portName);
 
 	/* return immediately if the WWPN matches ndlp */
-	if (!new_ndlp || (new_ndlp == ndlp))
+	if (new_ndlp == ndlp)
 		return ndlp;
-
-	/*
-	 * Unregister from backend if not done yet. Could have been skipped
-	 * due to ADISC
-	 */
-	lpfc_nlp_unreg_node(vport, new_ndlp);
 
 	if (phba->sli_rev == LPFC_SLI_REV4) {
 		active_rrqs_xri_bitmap = mempool_alloc(phba->active_rrq_pool,
@@ -1697,25 +1700,51 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 	}
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_NODE,
-			 "3178 PLOGI confirm: ndlp x%x x%x x%x: "
-			 "new_ndlp x%x x%x x%x\n",
+			 "3178 PLOGI confirm: ndlp x%x x%lx x%x: "
+			 "new_ndlp x%x x%lx x%x\n",
 			 ndlp->nlp_DID, ndlp->nlp_flag,  ndlp->nlp_fc4_type,
 			 (new_ndlp ? new_ndlp->nlp_DID : 0),
 			 (new_ndlp ? new_ndlp->nlp_flag : 0),
 			 (new_ndlp ? new_ndlp->nlp_fc4_type : 0));
 
-	keepDID = new_ndlp->nlp_DID;
+	if (!new_ndlp) {
+		rc = memcmp(&ndlp->nlp_portname, name,
+			    sizeof(struct lpfc_name));
+		if (!rc) {
+			if (active_rrqs_xri_bitmap)
+				mempool_free(active_rrqs_xri_bitmap,
+					     phba->active_rrq_pool);
+			return ndlp;
+		}
+		new_ndlp = lpfc_nlp_init(vport, ndlp->nlp_DID);
+		if (!new_ndlp) {
+			if (active_rrqs_xri_bitmap)
+				mempool_free(active_rrqs_xri_bitmap,
+					     phba->active_rrq_pool);
+			return ndlp;
+		}
+	} else {
+		if (phba->sli_rev == LPFC_SLI_REV4 &&
+		    active_rrqs_xri_bitmap)
+			memcpy(active_rrqs_xri_bitmap,
+			       new_ndlp->active_rrqs_xri_bitmap,
+			       phba->cfg_rrq_xri_bitmap_sz);
 
-	if (phba->sli_rev == LPFC_SLI_REV4 && active_rrqs_xri_bitmap)
-		memcpy(active_rrqs_xri_bitmap, new_ndlp->active_rrqs_xri_bitmap,
-		       phba->cfg_rrq_xri_bitmap_sz);
+		/*
+		 * Unregister from backend if not done yet. Could have been
+		 * skipped due to ADISC
+		 */
+		lpfc_nlp_unreg_node(vport, new_ndlp);
+	}
+
+	keepDID = new_ndlp->nlp_DID;
 
 	/* At this point in this routine, we know new_ndlp will be
 	 * returned. however, any previous GID_FTs that were done
 	 * would have updated nlp_fc4_type in ndlp, so we must ensure
 	 * new_ndlp has the right value.
 	 */
-	if (vport->fc_flag & FC_FABRIC) {
+	if (test_bit(FC_FABRIC, &vport->fc_flag)) {
 		keep_nlp_fc4_type = new_ndlp->nlp_fc4_type;
 		new_ndlp->nlp_fc4_type = ndlp->nlp_fc4_type;
 	}
@@ -1736,48 +1765,48 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 	new_ndlp->nlp_flag = ndlp->nlp_flag;
 
 	/* if new_ndlp had NLP_UNREG_INP set, keep it */
-	if (keep_new_nlp_flag & NLP_UNREG_INP)
-		new_ndlp->nlp_flag |= NLP_UNREG_INP;
+	if (test_bit(NLP_UNREG_INP, &keep_new_nlp_flag))
+		set_bit(NLP_UNREG_INP, &new_ndlp->nlp_flag);
 	else
-		new_ndlp->nlp_flag &= ~NLP_UNREG_INP;
+		clear_bit(NLP_UNREG_INP, &new_ndlp->nlp_flag);
 
 	/* if new_ndlp had NLP_RPI_REGISTERED set, keep it */
-	if (keep_new_nlp_flag & NLP_RPI_REGISTERED)
-		new_ndlp->nlp_flag |= NLP_RPI_REGISTERED;
+	if (test_bit(NLP_RPI_REGISTERED, &keep_new_nlp_flag))
+		set_bit(NLP_RPI_REGISTERED, &new_ndlp->nlp_flag);
 	else
-		new_ndlp->nlp_flag &= ~NLP_RPI_REGISTERED;
+		clear_bit(NLP_RPI_REGISTERED, &new_ndlp->nlp_flag);
 
 	/*
 	 * Retain the DROPPED flag. This will take care of the init
 	 * refcount when affecting the state change
 	 */
-	if (keep_new_nlp_flag & NLP_DROPPED)
-		new_ndlp->nlp_flag |= NLP_DROPPED;
+	if (test_bit(NLP_DROPPED, &keep_new_nlp_flag))
+		set_bit(NLP_DROPPED, &new_ndlp->nlp_flag);
 	else
-		new_ndlp->nlp_flag &= ~NLP_DROPPED;
+		clear_bit(NLP_DROPPED, &new_ndlp->nlp_flag);
 
 	ndlp->nlp_flag = keep_new_nlp_flag;
 
 	/* if ndlp had NLP_UNREG_INP set, keep it */
-	if (keep_nlp_flag & NLP_UNREG_INP)
-		ndlp->nlp_flag |= NLP_UNREG_INP;
+	if (test_bit(NLP_UNREG_INP, &keep_nlp_flag))
+		set_bit(NLP_UNREG_INP, &ndlp->nlp_flag);
 	else
-		ndlp->nlp_flag &= ~NLP_UNREG_INP;
+		clear_bit(NLP_UNREG_INP, &ndlp->nlp_flag);
 
 	/* if ndlp had NLP_RPI_REGISTERED set, keep it */
-	if (keep_nlp_flag & NLP_RPI_REGISTERED)
-		ndlp->nlp_flag |= NLP_RPI_REGISTERED;
+	if (test_bit(NLP_RPI_REGISTERED, &keep_nlp_flag))
+		set_bit(NLP_RPI_REGISTERED, &ndlp->nlp_flag);
 	else
-		ndlp->nlp_flag &= ~NLP_RPI_REGISTERED;
+		clear_bit(NLP_RPI_REGISTERED, &ndlp->nlp_flag);
 
 	/*
 	 * Retain the DROPPED flag. This will take care of the init
 	 * refcount when affecting the state change
 	 */
-	if (keep_nlp_flag & NLP_DROPPED)
-		ndlp->nlp_flag |= NLP_DROPPED;
+	if (test_bit(NLP_DROPPED, &keep_nlp_flag))
+		set_bit(NLP_DROPPED, &ndlp->nlp_flag);
 	else
-		ndlp->nlp_flag &= ~NLP_DROPPED;
+		clear_bit(NLP_DROPPED, &ndlp->nlp_flag);
 
 	spin_unlock_irq(&new_ndlp->lock);
 	spin_unlock_irq(&ndlp->lock);
@@ -1792,18 +1821,20 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 
 	/* Move this back to NPR state */
 	if (memcmp(&ndlp->nlp_portname, name, sizeof(struct lpfc_name)) == 0) {
-		/* The new_ndlp is replacing ndlp totally, so we need
-		 * to put ndlp on UNUSED list and try to free it.
+		/* The ndlp doesn't have a portname yet, but does have an
+		 * NPort ID.  The new_ndlp portname matches the Rport's
+		 * portname.  Reinstantiate the new_ndlp and reset the ndlp.
 		 */
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "3179 PLOGI confirm NEW: %x %x\n",
 			 new_ndlp->nlp_DID, keepDID);
 
 		/* Two ndlps cannot have the same did on the nodelist.
-		 * Note: for this case, ndlp has a NULL WWPN so setting
-		 * the nlp_fc4_type isn't required.
+		 * The KeepDID and keep_nlp_fc4_type need to be swapped
+		 * because ndlp is inflight with no WWPN.
 		 */
 		ndlp->nlp_DID = keepDID;
+		ndlp->nlp_fc4_type = keep_nlp_fc4_type;
 		lpfc_nlp_set_state(vport, ndlp, keep_nlp_state);
 		if (phba->sli_rev == LPFC_SLI_REV4 &&
 		    active_rrqs_xri_bitmap)
@@ -1818,9 +1849,8 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 
 		lpfc_unreg_rpi(vport, ndlp);
 
-		/* Two ndlps cannot have the same did and the fc4
-		 * type must be transferred because the ndlp is in
-		 * flight.
+		/* The ndlp and new_ndlp both have WWPNs but are swapping
+		 * NPort Ids and attributes.
 		 */
 		ndlp->nlp_DID = keepDID;
 		ndlp->nlp_fc4_type = keep_nlp_fc4_type;
@@ -1854,7 +1884,7 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 			     phba->active_rrq_pool);
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_NODE,
-			 "3173 PLOGI confirm exit: new_ndlp x%x x%x x%x\n",
+			 "3173 PLOGI confirm exit: new_ndlp x%x x%lx x%x\n",
 			 new_ndlp->nlp_DID, new_ndlp->nlp_flag,
 			 new_ndlp->nlp_fc4_type);
 
@@ -1875,21 +1905,17 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
 void
 lpfc_end_rscn(struct lpfc_vport *vport)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 
-	if (vport->fc_flag & FC_RSCN_MODE) {
+	if (test_bit(FC_RSCN_MODE, &vport->fc_flag)) {
 		/*
 		 * Check to see if more RSCNs came in while we were
 		 * processing this one.
 		 */
 		if (vport->fc_rscn_id_cnt ||
-		    (vport->fc_flag & FC_RSCN_DISCOVERY) != 0)
+		    test_bit(FC_RSCN_DISCOVERY, &vport->fc_flag))
 			lpfc_els_handle_rscn(vport);
-		else {
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag &= ~FC_RSCN_MODE;
-			spin_unlock_irq(shost->host_lock);
-		}
+		else
+			clear_bit(FC_RSCN_MODE, &vport->fc_flag);
 	}
 }
 
@@ -1910,14 +1936,14 @@ lpfc_cmpl_els_rrq(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		  struct lpfc_iocbq *rspiocb)
 {
 	struct lpfc_vport *vport = cmdiocb->vport;
-	struct lpfc_nodelist *ndlp = cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	struct lpfc_node_rrq *rrq;
 	u32 ulp_status = get_job_ulpstatus(phba, rspiocb);
 	u32 ulp_word4 = get_job_word4(phba, rspiocb);
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
 	rrq = cmdiocb->context_un.rrq;
-	cmdiocb->context_un.rsp_iocb = rspiocb;
+	cmdiocb->rsp_iocb = rspiocb;
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
 		"RRQ cmpl:      status:x%x/x%x did:x%x",
@@ -1934,16 +1960,16 @@ lpfc_cmpl_els_rrq(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 	if (ulp_status) {
 		/* Check for retry */
-		/* RRQ failed Don't print the vport to vport rjts */
+		/* Warn RRQ status Don't print the vport to vport rjts */
 		if (ulp_status != IOSTAT_LS_RJT ||
 		    (((ulp_word4) >> 16 != LSRJT_INVALID_CMD) &&
 		     ((ulp_word4) >> 16 != LSRJT_UNABLE_TPC)) ||
 		    (phba)->pport->cfg_log_verbose & LOG_ELS)
-			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-					 "2881 RRQ failure DID:%06X Status:"
-					 "x%x/x%x\n",
-					 ndlp->nlp_DID, ulp_status,
-					 ulp_word4);
+			lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+				      "2881 RRQ DID:%06X Status:"
+				      "x%x/x%x\n",
+				      ndlp->nlp_DID, ulp_status,
+				      ulp_word4);
 	}
 
 	lpfc_clr_rrq_active(phba, rrq->xritag, rrq);
@@ -1976,16 +2002,16 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		    struct lpfc_iocbq *rspiocb)
 {
 	struct lpfc_vport *vport = cmdiocb->vport;
-	struct Scsi_Host  *shost = lpfc_shost_from_vport(vport);
 	IOCB_t *irsp;
 	struct lpfc_nodelist *ndlp, *free_ndlp;
 	struct lpfc_dmabuf *prsp;
-	int disc;
+	bool disc;
 	struct serv_parm *sp = NULL;
 	u32 ulp_status, ulp_word4, did, iotag;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
-	cmdiocb->context_un.rsp_iocb = rspiocb;
+	cmdiocb->rsp_iocb = rspiocb;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
@@ -2014,24 +2040,20 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* Since ndlp can be freed in the disc state machine, note if this node
 	 * is being used during discovery.
 	 */
-	spin_lock_irq(&ndlp->lock);
-	disc = (ndlp->nlp_flag & NLP_NPR_2B_DISC);
-	ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-	spin_unlock_irq(&ndlp->lock);
+	disc = test_and_clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 
 	/* PLOGI completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0102 PLOGI completes to NPort x%06x "
-			 "Data: x%x x%x x%x x%x x%x\n",
-			 ndlp->nlp_DID, ndlp->nlp_fc4_type,
+			 "IoTag x%x Data: x%x x%x x%x x%x x%x\n",
+			 ndlp->nlp_DID, iotag,
+			 ndlp->nlp_fc4_type,
 			 ulp_status, ulp_word4,
 			 disc, vport->num_disc_nodes);
 
 	/* Check to see if link went down during discovery */
 	if (lpfc_els_chk_latt(vport)) {
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-		spin_unlock_irq(&ndlp->lock);
+		set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 		goto out;
 	}
 
@@ -2039,26 +2061,23 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* Check for retry */
 		if (lpfc_els_retry(phba, cmdiocb, rspiocb)) {
 			/* ELS command is being retried */
-			if (disc) {
-				spin_lock_irq(&ndlp->lock);
-				ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-				spin_unlock_irq(&ndlp->lock);
-			}
+			if (disc)
+				set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 			goto out;
 		}
-		/* PLOGI failed Don't print the vport to vport rjts */
+		/* Warn PLOGI status Don't print the vport to vport rjts */
 		if (ulp_status != IOSTAT_LS_RJT ||
 		    (((ulp_word4) >> 16 != LSRJT_INVALID_CMD) &&
 		     ((ulp_word4) >> 16 != LSRJT_UNABLE_TPC)) ||
 		    (phba)->pport->cfg_log_verbose & LOG_ELS)
-			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-					 "2753 PLOGI failure DID:%06X "
-					 "Status:x%x/x%x\n",
-					 ndlp->nlp_DID, ulp_status,
-					 ulp_word4);
+			lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+				      "2753 PLOGI DID:%06X "
+				      "Status:x%x/x%x\n",
+				      ndlp->nlp_DID, ulp_status,
+				      ulp_word4);
 
 		/* Do not call DSM for lpfc_els_abort'ed ELS cmds */
-		if (!lpfc_error_lost_link(ulp_status, ulp_word4))
+		if (!lpfc_error_lost_link(vport, ulp_status, ulp_word4))
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_CMPL_PLOGI);
 
@@ -2066,29 +2085,35 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * with the reglogin process.
 		 */
 		spin_lock_irq(&ndlp->lock);
-		if ((ndlp->nlp_flag & (NLP_ACC_REGLOGIN | NLP_RCV_PLOGI)) &&
+		if ((test_bit(NLP_ACC_REGLOGIN, &ndlp->nlp_flag) ||
+		     test_bit(NLP_RCV_PLOGI, &ndlp->nlp_flag)) &&
 		    ndlp->nlp_state == NLP_STE_REG_LOGIN_ISSUE) {
 			spin_unlock_irq(&ndlp->lock);
 			goto out;
 		}
-		spin_unlock_irq(&ndlp->lock);
 
 		/* No PLOGI collision and the node is not registered with the
 		 * scsi or nvme transport. It is no longer an active node. Just
 		 * start the device remove process.
 		 */
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
+			if (!test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else {
 		/* Good status, call state machine */
-		prsp = list_entry(((struct lpfc_dmabuf *)
-				   cmdiocb->context2)->list.next,
-				  struct lpfc_dmabuf, list);
+		prsp = list_get_first(&cmdiocb->cmd_dmabuf->list,
+				      struct lpfc_dmabuf, list);
+		if (!prsp)
+			goto out;
+		if (!lpfc_is_els_acc_rsp(prsp))
+			goto out;
 		ndlp = lpfc_plogi_confirm_nport(phba, prsp->virt, ndlp);
 
 		sp = (struct serv_parm *)((u8 *)prsp->virt +
@@ -2116,9 +2141,7 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		lpfc_more_plogi(vport);
 
 		if (vport->num_disc_nodes == 0) {
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag &= ~FC_NDISC_ACTIVE;
-			spin_unlock_irq(shost->host_lock);
+			clear_bit(FC_NDISC_ACTIVE, &vport->fc_flag);
 
 			lpfc_can_disctmo(vport);
 			lpfc_end_rscn(vport);
@@ -2132,7 +2155,7 @@ out:
 
 out_freeiocb:
 	/* Release the reference on the original I/O request. */
-	free_ndlp = (struct lpfc_nodelist *)cmdiocb->context1;
+	free_ndlp = cmdiocb->ndlp;
 
 	lpfc_els_free_iocb(phba, cmdiocb);
 	lpfc_nlp_put(free_ndlp);
@@ -2152,7 +2175,7 @@ out_freeiocb:
  * the lpfc_sli_issue_iocb() routine to send out PLOGI ELS command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding
- * the ndlp and the reference to ndlp will be stored into the context1 field
+ * the ndlp and the reference to ndlp will be stored into the ndlp field
  * of the IOCB for the completion callback function to the PLOGI ELS command.
  *
  * Return code
@@ -2178,14 +2201,16 @@ lpfc_issue_els_plogi(struct lpfc_vport *vport, uint32_t did, uint8_t retry)
 	 * outstanding UNREG_RPI mbox command completes, unless we
 	 * are going offline. This logic does not apply for Fabric DIDs
 	 */
-	if ((ndlp->nlp_flag & NLP_UNREG_INP) &&
+	if ((test_bit(NLP_IGNR_REG_CMPL, &ndlp->nlp_flag) ||
+	     test_bit(NLP_UNREG_INP, &ndlp->nlp_flag)) &&
 	    ((ndlp->nlp_DID & Fabric_DID_MASK) != Fabric_DID_MASK) &&
-	    !(vport->fc_flag & FC_OFFLINE_MODE)) {
+	    !test_bit(FC_OFFLINE_MODE, &vport->fc_flag)) {
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 				 "4110 Issue PLOGI x%x deferred "
-				 "on NPort x%x rpi x%x Data: x%px\n",
+				 "on NPort x%x rpi x%x flg x%lx Data:"
+				 " x%px\n",
 				 ndlp->nlp_defer_did, ndlp->nlp_DID,
-				 ndlp->nlp_rpi, ndlp);
+				 ndlp->nlp_rpi, ndlp->nlp_flag, ndlp);
 
 		/* We can only defer 1st PLOGI */
 		if (ndlp->nlp_defer_did == NLP_EVT_NOTHING_PENDING)
@@ -2199,11 +2224,7 @@ lpfc_issue_els_plogi(struct lpfc_vport *vport, uint32_t did, uint8_t retry)
 	if (!elsiocb)
 		return 1;
 
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_FCP_PRLI_RJT;
-	spin_unlock_irq(&ndlp->lock);
-
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	/* For PLOGI request, remainder of payload is service parameters */
 	*((uint32_t *) (pcmd)) = ELS_CMD_PLOGI;
@@ -2215,7 +2236,8 @@ lpfc_issue_els_plogi(struct lpfc_vport *vport, uint32_t did, uint8_t retry)
 	 * If we are a N-port connected to a Fabric, fix-up paramm's so logins
 	 * to device on remote loops work.
 	 */
-	if ((vport->fc_flag & FC_FABRIC) && !(vport->fc_flag & FC_PUBLIC_LOOP))
+	if (test_bit(FC_FABRIC, &vport->fc_flag) &&
+	    !test_bit(FC_PUBLIC_LOOP, &vport->fc_flag))
 		sp->cmn.altBbCredit = 1;
 
 	if (sp->cmn.fcphLow < FC_PH_4_3)
@@ -2255,8 +2277,8 @@ lpfc_issue_els_plogi(struct lpfc_vport *vport, uint32_t did, uint8_t retry)
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
 			      "Issue PLOGI:     did:x%x refcnt %d",
 			      did, kref_read(&ndlp->kref), 0);
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -2291,22 +2313,22 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_vport *vport = cmdiocb->vport;
 	struct lpfc_nodelist *ndlp;
 	char *mode;
-	u32 loglevel;
 	u32 ulp_status;
 	u32 ulp_word4;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
-	cmdiocb->context_un.rsp_iocb = rspiocb;
+	cmdiocb->rsp_iocb = rspiocb;
 
-	ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	ndlp = cmdiocb->ndlp;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
 
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_PRLI_SND;
+	clear_bit(NLP_PRLI_SND, &ndlp->nlp_flag);
 
 	/* Driver supports multiple FC4 types.  Counters matter. */
+	spin_lock_irq(&ndlp->lock);
 	vport->fc_prli_sent--;
 	ndlp->fc4_prli_sent--;
 	spin_unlock_irq(&ndlp->lock);
@@ -2319,9 +2341,10 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* PRLI completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0103 PRLI completes to NPort x%06x "
-			 "Data: x%x x%x x%x x%x\n",
+			 "Data: x%x x%x x%x x%x x%x\n",
 			 ndlp->nlp_DID, ulp_status, ulp_word4,
-			 vport->num_disc_nodes, ndlp->fc4_prli_sent);
+			 vport->num_disc_nodes, ndlp->fc4_prli_sent,
+			 ndlp->fc4_xpt_flags);
 
 	/* Check to see if link went down during discovery */
 	if (lpfc_els_chk_latt(vport))
@@ -2337,32 +2360,46 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* If we don't send GFT_ID to Fabric, a PRLI error
 		 * could be expected.
 		 */
-		if ((vport->fc_flag & FC_FABRIC) ||
-		    (vport->cfg_enable_fc4_type != LPFC_ENABLE_BOTH)) {
-			mode = KERN_ERR;
-			loglevel =  LOG_TRACE_EVENT;
-		} else {
+		if (test_bit(FC_FABRIC, &vport->fc_flag) ||
+		    vport->cfg_enable_fc4_type != LPFC_ENABLE_BOTH)
+			mode = KERN_WARNING;
+		else
 			mode = KERN_INFO;
-			loglevel =  LOG_ELS;
-		}
 
-		/* PRLI failed */
-		lpfc_printf_vlog(vport, mode, loglevel,
-				 "2754 PRLI failure DID:%06X Status:x%x/x%x, "
-				 "data: x%x\n",
+		/* Warn PRLI status */
+		lpfc_printf_vlog(vport, mode, LOG_ELS,
+				 "2754 PRLI DID:%06X Status:x%x/x%x, "
+				 "data: x%x x%x x%lx\n",
 				 ndlp->nlp_DID, ulp_status,
-				 ulp_word4, ndlp->fc4_prli_sent);
+				 ulp_word4, ndlp->nlp_state,
+				 ndlp->fc4_prli_sent, ndlp->nlp_flag);
 
 		/* Do not call DSM for lpfc_els_abort'ed ELS cmds */
-		if (!lpfc_error_lost_link(ulp_status, ulp_word4))
+		if (!lpfc_error_lost_link(vport, ulp_status, ulp_word4))
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_CMPL_PRLI);
+
+		/* The following condition catches an inflight transition
+		 * mismatch typically caused by an RSCN. Skip any
+		 * processing to allow recovery.
+		 */
+		if ((ndlp->nlp_state >= NLP_STE_PLOGI_ISSUE &&
+		     ndlp->nlp_state <= NLP_STE_REG_LOGIN_ISSUE) ||
+		    (ndlp->nlp_state == NLP_STE_NPR_NODE &&
+		     test_bit(NLP_DELAY_TMO, &ndlp->nlp_flag))) {
+			lpfc_printf_vlog(vport, KERN_ERR, LOG_NODE,
+					 "2784 PRLI cmpl: Allow Node recovery "
+					 "DID x%06x nstate x%x nflag x%lx\n",
+					 ndlp->nlp_DID, ndlp->nlp_state,
+					 ndlp->nlp_flag);
+			goto out;
+		}
 
 		/*
 		 * For P2P topology, retain the node so that PLOGI can be
 		 * attempted on it again.
 		 */
-		if (vport->fc_flag & FC_PT2PT)
+		if (test_bit(FC_PT2PT, &vport->fc_flag))
 			goto out;
 
 		/* As long as this node is not registered with the SCSI
@@ -2370,14 +2407,18 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * it is no longer an active node.  Otherwise devloss
 		 * handles the final cleanup.
 		 */
+		spin_lock_irq(&ndlp->lock);
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
 		    !ndlp->fc4_prli_sent) {
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
+			if (!test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else {
 		/* Good status, call state machine.  However, if another
 		 * PRLI is outstanding, don't call the state machine
@@ -2407,7 +2448,7 @@ out:
  * routine lpfc_sli_issue_iocb() to send out PRLI command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the PRLI ELS command.
  *
  * Return code
@@ -2434,7 +2475,7 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	 * the remote NPort beng a NVME Target.
 	 */
 	if (phba->sli_rev == LPFC_SLI_REV4 &&
-	    vport->fc_flag & FC_RSCN_MODE &&
+	    test_bit(FC_RSCN_MODE, &vport->fc_flag) &&
 	    vport->nvmei_support)
 		ndlp->nlp_fc4_type |= NLP_FC4_NVME;
 	local_nlp_type = ndlp->nlp_fc4_type;
@@ -2445,7 +2486,8 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	ndlp->nlp_type &= ~(NLP_FCP_TARGET | NLP_FCP_INITIATOR);
 	ndlp->nlp_type &= ~(NLP_NVME_TARGET | NLP_NVME_INITIATOR);
 	ndlp->nlp_fcp_info &= ~NLP_FCP_2_DEVICE;
-	ndlp->nlp_flag &= ~(NLP_FIRSTBURST | NLP_NPR_2B_DISC);
+	clear_bit(NLP_FIRSTBURST, &ndlp->nlp_flag);
+	clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 	ndlp->nvme_fb_size = 0;
 
  send_next_prli:
@@ -2481,7 +2523,7 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	/* For PRLI request, remainder of payload is service parameters */
 	memset(pcmd, 0, cmdsize);
@@ -2555,33 +2597,32 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	phba->fc_stat.elsXmitPRLI++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_prli;
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_PRLI_SND;
-
-	/* The vport counters are used for lpfc_scan_finished, but
-	 * the ndlp is used to track outstanding PRLIs for different
-	 * FC4 types.
-	 */
-	vport->fc_prli_sent++;
-	ndlp->fc4_prli_sent++;
-	spin_unlock_irq(&ndlp->lock);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
 			      "Issue PRLI:  did:x%x refcnt %d",
 			      ndlp->nlp_DID, kref_read(&ndlp->kref), 0);
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
-		goto err;
+		return 1;
 	}
 
 	rc = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, elsiocb, 0);
 	if (rc == IOCB_ERROR) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		lpfc_nlp_put(ndlp);
-		goto err;
+		return 1;
 	}
 
+	/* The vport counters are used for lpfc_scan_finished, but
+	 * the ndlp is used to track outstanding PRLIs for different
+	 * FC4 types.
+	 */
+	set_bit(NLP_PRLI_SND, &ndlp->nlp_flag);
+	spin_lock_irq(&ndlp->lock);
+	vport->fc_prli_sent++;
+	ndlp->fc4_prli_sent++;
+	spin_unlock_irq(&ndlp->lock);
 
 	/* The driver supports 2 FC4 types.  Make sure
 	 * a PRLI is issued for all types before exiting.
@@ -2591,12 +2632,6 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		goto send_next_prli;
 	else
 		return 0;
-
-err:
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_PRLI_SND;
-	spin_unlock_irq(&ndlp->lock);
-	return 1;
 }
 
 /**
@@ -2618,7 +2653,7 @@ lpfc_rscn_disc(struct lpfc_vport *vport)
 
 	/* RSCN discovery */
 	/* go thru NPR nodes and issue ELS PLOGIs */
-	if (vport->fc_npr_cnt)
+	if (atomic_read(&vport->fc_npr_cnt))
 		if (lpfc_els_disc_plogi(vport))
 			return;
 
@@ -2638,7 +2673,6 @@ lpfc_rscn_disc(struct lpfc_vport *vport)
 static void
 lpfc_adisc_done(struct lpfc_vport *vport)
 {
-	struct Scsi_Host   *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba   *phba = vport->phba;
 
 	/*
@@ -2646,7 +2680,7 @@ lpfc_adisc_done(struct lpfc_vport *vport)
 	 * and continue discovery.
 	 */
 	if ((phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) &&
-	    !(vport->fc_flag & FC_RSCN_MODE) &&
+	    !test_bit(FC_RSCN_MODE, &vport->fc_flag) &&
 	    (phba->sli_rev < LPFC_SLI_REV4)) {
 
 		/*
@@ -2675,15 +2709,13 @@ lpfc_adisc_done(struct lpfc_vport *vport)
 	if (vport->port_state < LPFC_VPORT_READY) {
 		/* If we get here, there is nothing to ADISC */
 		lpfc_issue_clear_la(phba, vport);
-		if (!(vport->fc_flag & FC_ABORT_DISCOVERY)) {
+		if (!test_bit(FC_ABORT_DISCOVERY, &vport->fc_flag)) {
 			vport->num_disc_nodes = 0;
 			/* go thru NPR list, issue ELS PLOGIs */
-			if (vport->fc_npr_cnt)
+			if (atomic_read(&vport->fc_npr_cnt))
 				lpfc_els_disc_plogi(vport);
 			if (!vport->num_disc_nodes) {
-				spin_lock_irq(shost->host_lock);
-				vport->fc_flag &= ~FC_NDISC_ACTIVE;
-				spin_unlock_irq(shost->host_lock);
+				clear_bit(FC_NDISC_ACTIVE, &vport->fc_flag);
 				lpfc_can_disctmo(vport);
 				lpfc_end_rscn(vport);
 			}
@@ -2710,11 +2742,12 @@ lpfc_more_adisc(struct lpfc_vport *vport)
 	/* Continue discovery with <num_disc_nodes> ADISCs to go */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 			 "0210 Continue discovery with %d ADISCs to go "
-			 "Data: x%x x%x x%x\n",
-			 vport->num_disc_nodes, vport->fc_adisc_cnt,
+			 "Data: x%x x%lx x%x\n",
+			 vport->num_disc_nodes,
+			 atomic_read(&vport->fc_adisc_cnt),
 			 vport->fc_flag, vport->port_state);
 	/* Check to see if there are more ADISCs to be sent */
-	if (vport->fc_flag & FC_NLP_MORE) {
+	if (test_bit(FC_NLP_MORE, &vport->fc_flag)) {
 		lpfc_set_disctmo(vport);
 		/* go thru NPR nodes and issue any remaining ELS ADISCs */
 		lpfc_els_disc_adisc(vport);
@@ -2747,22 +2780,25 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_vport *vport = cmdiocb->vport;
 	IOCB_t *irsp;
 	struct lpfc_nodelist *ndlp;
-	int  disc;
-	u32 ulp_status, ulp_word4, tmo;
+	bool  disc;
+	u32 ulp_status, ulp_word4, tmo, iotag;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
-	cmdiocb->context_un.rsp_iocb = rspiocb;
+	cmdiocb->rsp_iocb = rspiocb;
 
-	ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	ndlp = cmdiocb->ndlp;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
 
 	if (phba->sli_rev == LPFC_SLI_REV4) {
 		tmo = get_wqe_tmo(cmdiocb);
+		iotag = get_wqe_reqtag(cmdiocb);
 	} else {
 		irsp = &rspiocb->iocb;
 		tmo = irsp->ulpTimeout;
+		iotag = irsp->ulpIoTag;
 	}
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
@@ -2773,21 +2809,19 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* Since ndlp can be freed in the disc state machine, note if this node
 	 * is being used during discovery.
 	 */
-	spin_lock_irq(&ndlp->lock);
-	disc = (ndlp->nlp_flag & NLP_NPR_2B_DISC);
-	ndlp->nlp_flag &= ~(NLP_ADISC_SND | NLP_NPR_2B_DISC);
-	spin_unlock_irq(&ndlp->lock);
+	disc = test_and_clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
+	clear_bit(NLP_ADISC_SND, &ndlp->nlp_flag);
 	/* ADISC completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0104 ADISC completes to NPort x%x "
-			 "Data: x%x x%x x%x x%x x%x\n",
-			 ndlp->nlp_DID, ulp_status, ulp_word4,
+			 "IoTag x%x Data: x%x x%x x%x x%x x%x\n",
+			 ndlp->nlp_DID, iotag,
+			 ulp_status, ulp_word4,
 			 tmo, disc, vport->num_disc_nodes);
+
 	/* Check to see if link went down during discovery */
 	if (lpfc_els_chk_latt(vport)) {
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-		spin_unlock_irq(&ndlp->lock);
+		set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 		goto out;
 	}
 
@@ -2796,18 +2830,16 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		if (lpfc_els_retry(phba, cmdiocb, rspiocb)) {
 			/* ELS command is being retried */
 			if (disc) {
-				spin_lock_irq(&ndlp->lock);
-				ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-				spin_unlock_irq(&ndlp->lock);
+				set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 				lpfc_set_disctmo(vport);
 			}
 			goto out;
 		}
-		/* ADISC failed */
-		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-				 "2755 ADISC failure DID:%06X Status:x%x/x%x\n",
-				 ndlp->nlp_DID, ulp_status,
-				 ulp_word4);
+		/* Warn ADISC status */
+		lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+			      "2755 ADISC DID:%06X Status:x%x/x%x\n",
+			      ndlp->nlp_DID, ulp_status,
+			      ulp_word4);
 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 					NLP_EVT_CMPL_ADISC);
 
@@ -2815,13 +2847,17 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * transport, it is no longer an active node. Otherwise
 		 * devloss handles the final cleanup.
 		 */
+		spin_lock_irq(&ndlp->lock);
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
+			if (!test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else
 		/* Good status, call state machine */
 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
@@ -2848,7 +2884,7 @@ out:
  * to issue the ADISC ELS command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the ADISC ELS command.
  *
  * Return code
@@ -2872,7 +2908,7 @@ lpfc_issue_els_adisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	/* For ADISC request, remainder of payload is service parameters */
 	*((uint32_t *) (pcmd)) = ELS_CMD_ADISC;
@@ -2887,11 +2923,9 @@ lpfc_issue_els_adisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	phba->fc_stat.elsXmitADISC++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_adisc;
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_ADISC_SND;
-	spin_unlock_irq(&ndlp->lock);
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	set_bit(NLP_ADISC_SND, &ndlp->nlp_flag);
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto err;
 	}
@@ -2910,9 +2944,7 @@ lpfc_issue_els_adisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	return 0;
 
 err:
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_ADISC_SND;
-	spin_unlock_irq(&ndlp->lock);
+	clear_bit(NLP_ADISC_SND, &ndlp->nlp_flag);
 	return 1;
 }
 
@@ -2931,36 +2963,33 @@ static void
 lpfc_cmpl_els_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		   struct lpfc_iocbq *rspiocb)
 {
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	struct lpfc_vport *vport = ndlp->vport;
 	IOCB_t *irsp;
-	unsigned long flags;
 	uint32_t skip_recovery = 0;
 	int wake_up_waiter = 0;
 	u32 ulp_status;
 	u32 ulp_word4;
-	u32 tmo;
+	u32 tmo, iotag;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
-	cmdiocb->context_un.rsp_iocb = rspiocb;
+	cmdiocb->rsp_iocb = rspiocb;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
 
 	if (phba->sli_rev == LPFC_SLI_REV4) {
 		tmo = get_wqe_tmo(cmdiocb);
+		iotag = get_wqe_reqtag(cmdiocb);
 	} else {
 		irsp = &rspiocb->iocb;
 		tmo = irsp->ulpTimeout;
+		iotag = irsp->ulpIoTag;
 	}
 
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_LOGO_SND;
-	if (ndlp->save_flags & NLP_WAIT_FOR_LOGO) {
+	clear_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
+	if (test_and_clear_bit(NLP_WAIT_FOR_LOGO, &ndlp->save_flags))
 		wake_up_waiter = 1;
-		ndlp->save_flags &= ~NLP_WAIT_FOR_LOGO;
-	}
-	spin_unlock_irq(&ndlp->lock);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
 		"LOGO cmpl:       status:x%x/x%x did:x%x",
@@ -2970,9 +2999,11 @@ lpfc_cmpl_els_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* LOGO completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0105 LOGO completes to NPort x%x "
-			 "refcnt %d nflags x%x Data: x%x x%x x%x x%x\n",
-			 ndlp->nlp_DID, kref_read(&ndlp->kref), ndlp->nlp_flag,
-			 ulp_status, ulp_word4,
+			 "IoTag x%x refcnt %d nflags x%lx xflags x%x "
+			 "Data: x%x x%x x%x x%x\n",
+			 ndlp->nlp_DID, iotag,
+			 kref_read(&ndlp->kref), ndlp->nlp_flag,
+			 ndlp->fc4_xpt_flags, ulp_status, ulp_word4,
 			 tmo, vport->num_disc_nodes);
 
 	if (lpfc_els_chk_latt(vport)) {
@@ -2986,45 +3017,21 @@ lpfc_cmpl_els_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	 * discovery.  The PLOGI will retry.
 	 */
 	if (ulp_status) {
-		/* LOGO failed */
-		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-				 "2756 LOGO failure, No Retry DID:%06X "
-				 "Status:x%x/x%x\n",
-				 ndlp->nlp_DID, ulp_status,
-				 ulp_word4);
+		/* Warn LOGO status */
+		lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+			      "2756 LOGO, No Retry DID:%06X "
+			      "Status:x%x/x%x\n",
+			      ndlp->nlp_DID, ulp_status,
+			      ulp_word4);
 
-		if (lpfc_error_lost_link(ulp_status, ulp_word4)) {
+		if (lpfc_error_lost_link(vport, ulp_status, ulp_word4))
 			skip_recovery = 1;
-			goto out;
-		}
 	}
 
 	/* Call state machine. This will unregister the rpi if needed. */
 	lpfc_disc_state_machine(vport, ndlp, cmdiocb, NLP_EVT_CMPL_LOGO);
 
-	/* The driver sets this flag for an NPIV instance that doesn't want to
-	 * log into the remote port.
-	 */
-	if (ndlp->nlp_flag & NLP_TARGET_REMOVE) {
-		spin_lock_irq(&ndlp->lock);
-		if (phba->sli_rev == LPFC_SLI_REV4)
-			ndlp->nlp_flag |= NLP_RELEASE_RPI;
-		ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-		spin_unlock_irq(&ndlp->lock);
-		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
-					NLP_EVT_DEVICE_RM);
-		lpfc_els_free_iocb(phba, cmdiocb);
-		lpfc_nlp_put(ndlp);
-
-		/* Presume the node was released. */
-		return;
-	}
-
 out:
-	/* Driver is done with the IO.  */
-	lpfc_els_free_iocb(phba, cmdiocb);
-	lpfc_nlp_put(ndlp);
-
 	/* At this point, the LOGO processing is complete. NOTE: For a
 	 * pt2pt topology, we are assuming the NPortID will only change
 	 * on link up processing. For a LOGO / PLOGI initiated by the
@@ -3041,9 +3048,7 @@ out:
 	if (ndlp->nlp_type & (NLP_FCP_TARGET | NLP_NVME_TARGET) &&
 	    skip_recovery == 0) {
 		lpfc_cancel_retry_delay_tmo(vport, ndlp);
-		spin_lock_irqsave(&ndlp->lock, flags);
-		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
-		spin_unlock_irqrestore(&ndlp->lock, flags);
+		set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 				 "3187 LOGO completes to NPort x%x: Start "
@@ -3051,6 +3056,10 @@ out:
 				 ndlp->nlp_DID, ulp_status,
 				 ulp_word4, tmo,
 				 vport->num_disc_nodes);
+
+		lpfc_els_free_iocb(phba, cmdiocb);
+		lpfc_nlp_put(ndlp);
+
 		lpfc_disc_start(vport);
 		return;
 	}
@@ -3061,12 +3070,14 @@ out:
 	 * register with the transport.
 	 */
 	if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-		spin_unlock_irq(&ndlp->lock);
+		clear_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 					NLP_EVT_DEVICE_RM);
 	}
+
+	/* Driver is done with the I/O. */
+	lpfc_els_free_iocb(phba, cmdiocb);
+	lpfc_nlp_put(ndlp);
 }
 
 /**
@@ -3081,7 +3092,7 @@ out:
  * lpfc_sli_issue_iocb() routine to send out the LOGO ELS command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the LOGO ELS command.
  *
  * Callers of this routine are expected to unregister the RPI first
@@ -3100,12 +3111,8 @@ lpfc_issue_els_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	uint16_t cmdsize;
 	int rc;
 
-	spin_lock_irq(&ndlp->lock);
-	if (ndlp->nlp_flag & NLP_LOGO_SND) {
-		spin_unlock_irq(&ndlp->lock);
+	if (test_bit(NLP_LOGO_SND, &ndlp->nlp_flag))
 		return 0;
-	}
-	spin_unlock_irq(&ndlp->lock);
 
 	cmdsize = (2 * sizeof(uint32_t)) + sizeof(struct lpfc_name);
 	elsiocb = lpfc_prep_els_iocb(vport, 1, cmdsize, retry, ndlp,
@@ -3113,7 +3120,7 @@ lpfc_issue_els_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_LOGO;
 	pcmd += sizeof(uint32_t);
 
@@ -3124,12 +3131,10 @@ lpfc_issue_els_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	phba->fc_stat.elsXmitLOGO++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_logo;
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_LOGO_SND;
-	ndlp->nlp_flag &= ~NLP_ISSUE_LOGO;
-	spin_unlock_irq(&ndlp->lock);
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	set_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
+	clear_bit(NLP_ISSUE_LOGO, &ndlp->nlp_flag);
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto err;
 	}
@@ -3152,9 +3157,7 @@ lpfc_issue_els_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	return 0;
 
 err:
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_LOGO_SND;
-	spin_unlock_irq(&ndlp->lock);
+	clear_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
 	return 1;
 }
 
@@ -3207,7 +3210,7 @@ lpfc_cmpl_els_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* Check to see if link went down during discovery */
 	lpfc_els_chk_latt(vport);
 
-	free_ndlp = (struct lpfc_nodelist *)cmdiocb->context1;
+	free_ndlp = cmdiocb->ndlp;
 
 	lpfc_els_free_iocb(phba, cmdiocb);
 	lpfc_nlp_put(free_ndlp);
@@ -3230,14 +3233,13 @@ lpfc_cmpl_els_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 static int
 lpfc_reg_fab_ctrl_node(struct lpfc_vport *vport, struct lpfc_nodelist *fc_ndlp)
 {
-	int rc = 0;
+	int rc;
 	struct lpfc_hba *phba = vport->phba;
 	struct lpfc_nodelist *ns_ndlp;
 	LPFC_MBOXQ_t *mbox;
-	struct lpfc_dmabuf *mp;
 
-	if (fc_ndlp->nlp_flag & NLP_RPI_REGISTERED)
-		return rc;
+	if (test_bit(NLP_RPI_REGISTERED, &fc_ndlp->nlp_flag))
+		return 0;
 
 	ns_ndlp = lpfc_findnode_did(vport, NameServer_DID);
 	if (!ns_ndlp)
@@ -3254,7 +3256,7 @@ lpfc_reg_fab_ctrl_node(struct lpfc_vport *vport, struct lpfc_nodelist *fc_ndlp)
 	if (!mbox) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_NODE,
 				 "0936 %s: no memory for reg_login "
-				 "Data: x%x x%x x%x x%x\n", __func__,
+				 "Data: x%x x%x x%lx x%x\n", __func__,
 				 fc_ndlp->nlp_DID, fc_ndlp->nlp_state,
 				 fc_ndlp->nlp_flag, fc_ndlp->nlp_rpi);
 		return -ENOMEM;
@@ -3266,12 +3268,12 @@ lpfc_reg_fab_ctrl_node(struct lpfc_vport *vport, struct lpfc_nodelist *fc_ndlp)
 		goto out;
 	}
 
-	fc_ndlp->nlp_flag |= NLP_REG_LOGIN_SEND;
+	set_bit(NLP_REG_LOGIN_SEND, &fc_ndlp->nlp_flag);
 	mbox->mbox_cmpl = lpfc_mbx_cmpl_fc_reg_login;
 	mbox->ctx_ndlp = lpfc_nlp_get(fc_ndlp);
 	if (!mbox->ctx_ndlp) {
 		rc = -ENOMEM;
-		goto out_mem;
+		goto out;
 	}
 
 	mbox->vport = vport;
@@ -3279,24 +3281,18 @@ lpfc_reg_fab_ctrl_node(struct lpfc_vport *vport, struct lpfc_nodelist *fc_ndlp)
 	if (rc == MBX_NOT_FINISHED) {
 		rc = -ENODEV;
 		lpfc_nlp_put(fc_ndlp);
-		goto out_mem;
+		goto out;
 	}
 	/* Success path. Exit. */
 	lpfc_nlp_set_state(vport, fc_ndlp,
 			   NLP_STE_REG_LOGIN_ISSUE);
 	return 0;
 
- out_mem:
-	fc_ndlp->nlp_flag &= ~NLP_REG_LOGIN_SEND;
-	mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
-	lpfc_mbuf_free(phba, mp->virt, mp->phys);
-	kfree(mp);
-
  out:
-	mempool_free(mbox, phba->mbox_mem_pool);
+	lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_NODE,
 			 "0938 %s: failed to format reg_login "
-			 "Data: x%x x%x x%x x%x\n", __func__,
+			 "Data: x%x x%x x%lx x%x\n", __func__,
 			 fc_ndlp->nlp_DID, fc_ndlp->nlp_state,
 			 fc_ndlp->nlp_flag, fc_ndlp->nlp_rpi);
 	return rc;
@@ -3323,7 +3319,7 @@ lpfc_cmpl_els_disc_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_dmabuf *pcmd, *prsp;
 	u32 *pdata;
 	u32 cmd;
-	struct lpfc_nodelist *ndlp = cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	u32 ulp_status, ulp_word4, tmo, did, iotag;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
@@ -3348,7 +3344,7 @@ lpfc_cmpl_els_disc_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			 "0217 ELS cmd tag x%x completes Data: x%x x%x x%x x%x\n",
 			 iotag, ulp_status, ulp_word4, tmo, cmdiocb->retry);
 
-	pcmd = (struct lpfc_dmabuf *)cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	if (!pcmd)
 		goto out;
 
@@ -3371,7 +3367,6 @@ lpfc_cmpl_els_disc_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				lpfc_issue_els_edc(vport, cmdiocb->retry);
 				break;
 			case ELS_CMD_RDF:
-				cmdiocb->context1 = NULL; /* save ndlp refcnt */
 				lpfc_issue_els_rdf(vport, cmdiocb->retry);
 				break;
 			}
@@ -3404,6 +3399,8 @@ lpfc_cmpl_els_disc_cmd(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 		prdf = (struct lpfc_els_rdf_rsp *)prsp->virt;
 		if (!prdf)
+			goto out;
+		if (!lpfc_is_els_acc_rsp(prsp))
 			goto out;
 
 		for (i = 0; i < ELS_RDF_REG_TAG_CNT &&
@@ -3439,7 +3436,7 @@ out:
  * routine is invoked to send the SCR IOCB.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the SCR ELS command.
  *
  * Return code
@@ -3481,7 +3478,7 @@ lpfc_issue_els_scr(struct lpfc_vport *vport, uint8_t retry)
 			return 1;
 		}
 	}
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *) (pcmd)) = ELS_CMD_SCR;
 	pcmd += sizeof(uint32_t);
@@ -3496,8 +3493,8 @@ lpfc_issue_els_scr(struct lpfc_vport *vport, uint8_t retry)
 
 	phba->fc_stat.elsXmitSCR++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_disc_cmd;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -3528,7 +3525,7 @@ lpfc_issue_els_scr(struct lpfc_vport *vport, uint8_t retry)
  *  replay the RSCN to registered recipients.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the RSCN ELS command.
  *
  * Return code
@@ -3551,10 +3548,10 @@ lpfc_issue_els_rscn(struct lpfc_vport *vport, uint8_t retry)
 
 	/* Not supported for private loop */
 	if (phba->fc_topology == LPFC_TOPOLOGY_LOOP &&
-	    !(vport->fc_flag & FC_PUBLIC_LOOP))
+	    !test_bit(FC_PUBLIC_LOOP, &vport->fc_flag))
 		return 1;
 
-	if (vport->fc_flag & FC_PT2PT) {
+	if (test_bit(FC_PT2PT, &vport->fc_flag)) {
 		/* find any mapped nport - that would be the other nport */
 		ndlp = lpfc_findnode_mapped(vport);
 		if (!ndlp)
@@ -3578,7 +3575,7 @@ lpfc_issue_els_rscn(struct lpfc_vport *vport, uint8_t retry)
 	if (!elsiocb)
 		return 1;
 
-	event = ((struct lpfc_dmabuf *)elsiocb->context2)->virt;
+	event = elsiocb->cmd_dmabuf->virt;
 
 	event->rscn.rscn_cmd = ELS_RSCN;
 	event->rscn.rscn_page_len = sizeof(struct fc_els_rscn_page);
@@ -3593,8 +3590,8 @@ lpfc_issue_els_rscn(struct lpfc_vport *vport, uint8_t retry)
 
 	phba->fc_stat.elsXmitRSCN++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_cmd;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -3627,7 +3624,7 @@ lpfc_issue_els_rscn(struct lpfc_vport *vport, uint8_t retry)
  * lpfc_sli_issue_iocb() routine is invoked to send the FARPR ELS command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the FARPR ELS command.
  *
  * Return code
@@ -3662,7 +3659,7 @@ lpfc_issue_els_farpr(struct lpfc_vport *vport, uint32_t nportid, uint8_t retry)
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *) (pcmd)) = ELS_CMD_FARPR;
 	pcmd += sizeof(uint32_t);
@@ -3692,8 +3689,8 @@ lpfc_issue_els_farpr(struct lpfc_vport *vport, uint32_t nportid, uint8_t retry)
 
 	phba->fc_stat.elsXmitFARPR++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_cmd;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -3724,7 +3721,7 @@ lpfc_issue_els_farpr(struct lpfc_vport *vport, uint32_t nportid, uint8_t retry)
  * for diagnostic functions.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the RDF ELS command.
  *
  * Return code
@@ -3761,8 +3758,7 @@ lpfc_issue_els_rdf(struct lpfc_vport *vport, uint8_t retry)
 		return -ENOMEM;
 
 	/* Configure the payload for the supported FPIN events. */
-	prdf = (struct lpfc_els_rdf_req *)
-		(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	prdf = (struct lpfc_els_rdf_req *)elsiocb->cmd_dmabuf->virt;
 	memset(prdf, 0, cmdsize);
 	prdf->rdf.fpin_cmd = ELS_RDF;
 	prdf->rdf.desc_len = cpu_to_be32(sizeof(struct lpfc_els_rdf_req) -
@@ -3783,8 +3779,8 @@ lpfc_issue_els_rdf(struct lpfc_vport *vport, uint8_t retry)
 
 	phba->cgn_fpin_frequency = LPFC_FPIN_INIT_FREQ;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_disc_cmd;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return -EIO;
 	}
@@ -3855,9 +3851,6 @@ lpfc_least_capable_settings(struct lpfc_hba *phba,
 {
 	u32 rsp_sig_cap = 0, drv_sig_cap = 0;
 	u32 rsp_sig_freq_cyc = 0, rsp_sig_freq_scale = 0;
-	struct lpfc_cgn_info *cp;
-	u32 crc;
-	u16 sig_freq;
 
 	/* Get rsp signal and frequency capabilities.  */
 	rsp_sig_cap = be32_to_cpu(pcgd->xmt_signal_capability);
@@ -3913,25 +3906,7 @@ lpfc_least_capable_settings(struct lpfc_hba *phba,
 		}
 	}
 
-	if (!phba->cgn_i)
-		return;
-
-	/* Update signal frequency in congestion info buffer */
-	cp = (struct lpfc_cgn_info *)phba->cgn_i->virt;
-
-	/* Frequency (in ms) Signal Warning/Signal Congestion Notifications
-	 * are received by the HBA
-	 */
-	sig_freq = phba->cgn_sig_freq;
-
-	if (phba->cgn_reg_signal == EDC_CG_SIG_WARN_ONLY)
-		cp->cgn_warn_freq = cpu_to_le16(sig_freq);
-	if (phba->cgn_reg_signal == EDC_CG_SIG_WARN_ALARM) {
-		cp->cgn_alarm_freq = cpu_to_le16(sig_freq);
-		cp->cgn_warn_freq = cpu_to_le16(sig_freq);
-	}
-	crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ, LPFC_CGN_CRC32_SEED);
-	cp->cgn_info_crc = cpu_to_le32(crc);
+	/* We are NOT recording signal frequency in congestion info buffer */
 	return;
 
 out_no_support:
@@ -3973,7 +3948,7 @@ lpfc_cmpl_els_edc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_nodelist *ndlp;
 	u32 ulp_status, ulp_word4, tmo, did, iotag;
 
-	ndlp = cmdiocb->context1;
+	ndlp = cmdiocb->ndlp;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
@@ -3997,7 +3972,7 @@ lpfc_cmpl_els_edc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			"4201 EDC cmd tag x%x completes Data: x%x x%x x%x\n",
 			iotag, ulp_status, ulp_word4, tmo);
 
-	pcmd = (struct lpfc_dmabuf *)cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	if (!pcmd)
 		goto out;
 
@@ -4018,11 +3993,15 @@ lpfc_cmpl_els_edc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		goto out;
 
 	/* ELS cmd tag <ulpIoTag> completes */
-	lpfc_printf_log(phba, KERN_INFO, LOG_ELS | LOG_CGN_MGMT,
+	lpfc_printf_log(phba, KERN_INFO,
+			LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 			"4676 Fabric EDC Rsp: "
 			"0x%02x, 0x%08x\n",
 			edc_rsp->acc_hdr.la_cmd,
 			be32_to_cpu(edc_rsp->desc_list_len));
+
+	if (!lpfc_is_els_acc_rsp(prsp))
+		goto out;
 
 	/*
 	 * Payload length in bytes is the response descriptor list
@@ -4055,18 +4034,18 @@ lpfc_cmpl_els_edc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			if (bytes_remain < FC_TLV_DESC_SZ_FROM_LENGTH(tlv) ||
 			    FC_TLV_DESC_SZ_FROM_LENGTH(tlv) !=
 					sizeof(struct fc_diag_lnkflt_desc)) {
-				lpfc_printf_log(
-					phba, KERN_WARNING, LOG_CGN_MGMT,
+				lpfc_printf_log(phba, KERN_WARNING,
+					LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 					"6462 Truncated Link Fault Diagnostic "
 					"descriptor[%d]: %d vs 0x%zx 0x%zx\n",
 					desc_cnt, bytes_remain,
 					FC_TLV_DESC_SZ_FROM_LENGTH(tlv),
-					sizeof(struct fc_diag_cg_sig_desc));
+					sizeof(struct fc_diag_lnkflt_desc));
 				goto out;
 			}
 			plnkflt = (struct fc_diag_lnkflt_desc *)tlv;
-			lpfc_printf_log(
-				phba, KERN_INFO, LOG_ELS | LOG_CGN_MGMT,
+			lpfc_printf_log(phba, KERN_INFO,
+				LOG_ELS | LOG_LDS_EVENT,
 				"4617 Link Fault Desc Data: 0x%08x 0x%08x "
 				"0x%08x 0x%08x 0x%08x\n",
 				be32_to_cpu(plnkflt->desc_tag),
@@ -4146,8 +4125,26 @@ out:
 }
 
 static void
-lpfc_format_edc_cgn_desc(struct lpfc_hba *phba, struct fc_diag_cg_sig_desc *cgd)
+lpfc_format_edc_lft_desc(struct lpfc_hba *phba, struct fc_tlv_desc *tlv)
 {
+	struct fc_diag_lnkflt_desc *lft = (struct fc_diag_lnkflt_desc *)tlv;
+
+	lft->desc_tag = cpu_to_be32(ELS_DTAG_LNK_FAULT_CAP);
+	lft->desc_len = cpu_to_be32(
+		FC_TLV_DESC_LENGTH_FROM_SZ(struct fc_diag_lnkflt_desc));
+
+	lft->degrade_activate_threshold =
+		cpu_to_be32(phba->degrade_activate_threshold);
+	lft->degrade_deactivate_threshold =
+		cpu_to_be32(phba->degrade_deactivate_threshold);
+	lft->fec_degrade_interval = cpu_to_be32(phba->fec_degrade_interval);
+}
+
+static void
+lpfc_format_edc_cgn_desc(struct lpfc_hba *phba, struct fc_tlv_desc *tlv)
+{
+	struct fc_diag_cg_sig_desc *cgd = (struct fc_diag_cg_sig_desc *)tlv;
+
 	/* We are assuming cgd was zero'ed before calling this routine */
 
 	/* Configure the congestion detection capability */
@@ -4191,6 +4188,23 @@ lpfc_format_edc_cgn_desc(struct lpfc_hba *phba, struct fc_diag_cg_sig_desc *cgd)
 		cpu_to_be16(EDC_CG_SIGFREQ_MSEC);
 }
 
+static bool
+lpfc_link_is_lds_capable(struct lpfc_hba *phba)
+{
+	if (!(phba->lmt & LMT_64Gb))
+		return false;
+	if (phba->sli_rev != LPFC_SLI_REV4)
+		return false;
+
+	if (phba->sli4_hba.conf_trunk) {
+		if (phba->trunk_link.phy_lnk_speed == LPFC_USER_LINK_SPEED_64G)
+			return true;
+	} else if (phba->fc_linkspeed == LPFC_LINK_SPEED_64GHZ) {
+		return true;
+	}
+	return false;
+}
+
  /**
   * lpfc_issue_els_edc - Exchange Diagnostic Capabilities with the fabric.
   * @vport: pointer to a host virtual N_Port data structure.
@@ -4218,12 +4232,12 @@ lpfc_issue_els_edc(struct lpfc_vport *vport, uint8_t retry)
 {
 	struct lpfc_hba  *phba = vport->phba;
 	struct lpfc_iocbq *elsiocb;
-	struct lpfc_els_edc_req *edc_req;
-	struct fc_diag_cg_sig_desc *cgn_desc;
+	struct fc_els_edc *edc_req;
+	struct fc_tlv_desc *tlv;
 	u16 cmdsize;
 	struct lpfc_nodelist *ndlp;
 	u8 *pcmd = NULL;
-	u32 edc_req_size, cgn_desc_size;
+	u32 cgn_desc_size, lft_desc_size;
 	int rc;
 
 	if (vport->port_type == LPFC_NPIV_PORT)
@@ -4233,40 +4247,48 @@ lpfc_issue_els_edc(struct lpfc_vport *vport, uint8_t retry)
 	if (!ndlp || ndlp->nlp_state != NLP_STE_UNMAPPED_NODE)
 		return -ENODEV;
 
-	/* If HBA doesn't support signals, drop into RDF */
-	if (!phba->cgn_init_reg_signal)
+	cgn_desc_size = (phba->cgn_init_reg_signal) ?
+				sizeof(struct fc_diag_cg_sig_desc) : 0;
+	lft_desc_size = (lpfc_link_is_lds_capable(phba)) ?
+				sizeof(struct fc_diag_lnkflt_desc) : 0;
+	cmdsize = cgn_desc_size + lft_desc_size;
+
+	/* Skip EDC if no applicable descriptors */
+	if (!cmdsize)
 		goto try_rdf;
 
-	edc_req_size = sizeof(struct fc_els_edc);
-	cgn_desc_size = sizeof(struct fc_diag_cg_sig_desc);
-	cmdsize = edc_req_size + cgn_desc_size;
+	cmdsize += sizeof(struct fc_els_edc);
 	elsiocb = lpfc_prep_els_iocb(vport, 1, cmdsize, retry, ndlp,
 				     ndlp->nlp_DID, ELS_CMD_EDC);
 	if (!elsiocb)
 		goto try_rdf;
 
 	/* Configure the payload for the supported Diagnostics capabilities. */
-	pcmd = (u8 *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
 	memset(pcmd, 0, cmdsize);
-	edc_req = (struct lpfc_els_edc_req *)pcmd;
-	edc_req->edc.desc_len = cpu_to_be32(cgn_desc_size);
-	edc_req->edc.edc_cmd = ELS_EDC;
+	edc_req = (struct fc_els_edc *)pcmd;
+	edc_req->desc_len = cpu_to_be32(cgn_desc_size + lft_desc_size);
+	edc_req->edc_cmd = ELS_EDC;
+	tlv = edc_req->desc;
 
-	cgn_desc = &edc_req->cgn_desc;
+	if (cgn_desc_size) {
+		lpfc_format_edc_cgn_desc(phba, tlv);
+		phba->cgn_sig_freq = lpfc_fabric_cgn_frequency;
+		tlv = fc_tlv_next_desc(tlv);
+	}
 
-	lpfc_format_edc_cgn_desc(phba, cgn_desc);
+	if (lft_desc_size)
+		lpfc_format_edc_lft_desc(phba, tlv);
 
-	phba->cgn_sig_freq = lpfc_fabric_cgn_frequency;
-
-	lpfc_printf_vlog(vport, KERN_INFO, LOG_CGN_MGMT,
+	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_CGN_MGMT,
 			 "4623 Xmit EDC to remote "
 			 "NPORT x%x reg_sig x%x reg_fpin:x%x\n",
 			 ndlp->nlp_DID, phba->cgn_reg_signal,
 			 phba->cgn_reg_fpin);
 
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_disc_cmd;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return -EIO;
 	}
@@ -4307,14 +4329,10 @@ try_rdf:
 void
 lpfc_cancel_retry_delay_tmo(struct lpfc_vport *vport, struct lpfc_nodelist *nlp)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_work_evt *evtp;
 
-	if (!(nlp->nlp_flag & NLP_DELAY_TMO))
+	if (!test_and_clear_bit(NLP_DELAY_TMO, &nlp->nlp_flag))
 		return;
-	spin_lock_irq(&nlp->lock);
-	nlp->nlp_flag &= ~NLP_DELAY_TMO;
-	spin_unlock_irq(&nlp->lock);
 	del_timer_sync(&nlp->nlp_delayfunc);
 	nlp->nlp_last_elscmd = 0;
 	if (!list_empty(&nlp->els_retry_evt.evt_listp)) {
@@ -4323,10 +4341,7 @@ lpfc_cancel_retry_delay_tmo(struct lpfc_vport *vport, struct lpfc_nodelist *nlp)
 		evtp = &nlp->els_retry_evt;
 		lpfc_nlp_put((struct lpfc_nodelist *)evtp->evt_arg1);
 	}
-	if (nlp->nlp_flag & NLP_NPR_2B_DISC) {
-		spin_lock_irq(&nlp->lock);
-		nlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-		spin_unlock_irq(&nlp->lock);
+	if (test_and_clear_bit(NLP_NPR_2B_DISC, &nlp->nlp_flag)) {
 		if (vport->num_disc_nodes) {
 			if (vport->port_state < LPFC_VPORT_READY) {
 				/* Check if there are more ADISCs to be sent */
@@ -4335,9 +4350,8 @@ lpfc_cancel_retry_delay_tmo(struct lpfc_vport *vport, struct lpfc_nodelist *nlp)
 				/* Check if there are more PLOGIs to be sent */
 				lpfc_more_plogi(vport);
 				if (vport->num_disc_nodes == 0) {
-					spin_lock_irq(shost->host_lock);
-					vport->fc_flag &= ~FC_NDISC_ACTIVE;
-					spin_unlock_irq(shost->host_lock);
+					clear_bit(FC_NDISC_ACTIVE,
+						  &vport->fc_flag);
 					lpfc_can_disctmo(vport);
 					lpfc_end_rscn(vport);
 				}
@@ -4370,23 +4384,23 @@ lpfc_els_retry_delay(struct timer_list *t)
 	unsigned long flags;
 	struct lpfc_work_evt  *evtp = &ndlp->els_retry_evt;
 
+	/* Hold a node reference for outstanding queued work */
+	if (!lpfc_nlp_get(ndlp))
+		return;
+
 	spin_lock_irqsave(&phba->hbalock, flags);
 	if (!list_empty(&evtp->evt_listp)) {
 		spin_unlock_irqrestore(&phba->hbalock, flags);
+		lpfc_nlp_put(ndlp);
 		return;
 	}
 
-	/* We need to hold the node by incrementing the reference
-	 * count until the queued work is done
-	 */
-	evtp->evt_arg1  = lpfc_nlp_get(ndlp);
-	if (evtp->evt_arg1) {
-		evtp->evt = LPFC_EVT_ELS_RETRY;
-		list_add_tail(&evtp->evt_listp, &phba->work_list);
-		lpfc_worker_wake_up(phba);
-	}
+	evtp->evt_arg1 = ndlp;
+	evtp->evt = LPFC_EVT_ELS_RETRY;
+	list_add_tail(&evtp->evt_listp, &phba->work_list);
 	spin_unlock_irqrestore(&phba->hbalock, flags);
-	return;
+
+	lpfc_worker_wake_up(phba);
 }
 
 /**
@@ -4407,14 +4421,11 @@ lpfc_els_retry_delay_handler(struct lpfc_nodelist *ndlp)
 	spin_lock_irq(&ndlp->lock);
 	cmd = ndlp->nlp_last_elscmd;
 	ndlp->nlp_last_elscmd = 0;
-
-	if (!(ndlp->nlp_flag & NLP_DELAY_TMO)) {
-		spin_unlock_irq(&ndlp->lock);
-		return;
-	}
-
-	ndlp->nlp_flag &= ~NLP_DELAY_TMO;
 	spin_unlock_irq(&ndlp->lock);
+
+	if (!test_and_clear_bit(NLP_DELAY_TMO, &ndlp->nlp_flag))
+		return;
+
 	/*
 	 * If a discovery event readded nlp_delayfunc after timer
 	 * firing and before processing the timer, cancel the
@@ -4454,7 +4465,7 @@ lpfc_els_retry_delay_handler(struct lpfc_nodelist *ndlp)
 		}
 		break;
 	case ELS_CMD_FDISC:
-		if (!(vport->fc_flag & FC_VPORT_NEEDS_INIT_VPI))
+		if (!test_bit(FC_VPORT_NEEDS_INIT_VPI, &vport->fc_flag))
 			lpfc_issue_els_fdisc(vport, ndlp, retry);
 		break;
 	}
@@ -4544,8 +4555,8 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 {
 	struct lpfc_vport *vport = cmdiocb->vport;
 	union lpfc_wqe128 *irsp = &rspiocb->wqe;
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
-	struct lpfc_dmabuf *pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
+	struct lpfc_dmabuf *pcmd = cmdiocb->cmd_dmabuf;
 	uint32_t *elscmd;
 	struct ls_rjt stat;
 	int retry = 0, maxretry = lpfc_max_els_tries, delay = 0;
@@ -4555,9 +4566,10 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	int link_reset = 0, rc;
 	u32 ulp_status = get_job_ulpstatus(phba, rspiocb);
 	u32 ulp_word4 = get_job_word4(phba, rspiocb);
+	u8 rsn_code_exp = 0;
 
 
-	/* Note: context2 may be 0 for internal driver abort
+	/* Note: cmd_dmabuf may be 0 for internal driver abort
 	 * of delays ELS command.
 	 */
 
@@ -4596,15 +4608,6 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	case IOSTAT_LOCAL_REJECT:
 		switch ((ulp_word4 & IOERR_PARAM_MASK)) {
 		case IOERR_LOOP_OPEN_FAILURE:
-			if (cmd == ELS_CMD_FLOGI) {
-				if (PCI_DEVICE_ID_HORNET ==
-					phba->pcidev->device) {
-					phba->fc_topology = LPFC_TOPOLOGY_LOOP;
-					phba->pport->fc_myDID = 0;
-					phba->alpa_map[0] = 0;
-					phba->alpa_map[1] = 0;
-				}
-			}
 			if (cmd == ELS_CMD_PLOGI && cmdiocb->retry == 0)
 				delay = 1000;
 			retry = 1;
@@ -4642,6 +4645,15 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				/* the nameserver fails */
 				maxretry = 0;
 				delay = 100;
+			} else if (cmd == ELS_CMD_PRLI &&
+				   ndlp->nlp_state != NLP_STE_PRLI_ISSUE) {
+				/* State-command disagreement.  The PRLI was
+				 * failed with an invalid rpi meaning there
+				 * some unexpected state change.  Don't retry.
+				 */
+				maxretry = 0;
+				retry = 0;
+				break;
 			}
 			retry = 1;
 			break;
@@ -4692,7 +4704,7 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* Added for Vendor specifc support
 		 * Just keep retrying for these Rsn / Exp codes
 		 */
-		if ((vport->fc_flag & FC_PT2PT) &&
+		if (test_bit(FC_PT2PT, &vport->fc_flag) &&
 		    cmd == ELS_CMD_NVMEPRLI) {
 			switch (stat.un.b.lsRjtRsnCode) {
 			case LSRJT_UNABLE_TPC:
@@ -4705,72 +4717,87 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 						 "support NVME, disabling NVME\n",
 						 stat.un.b.lsRjtRsnCode);
 				retry = 0;
-				vport->fc_flag |= FC_PT2PT_NO_NVME;
+				set_bit(FC_PT2PT_NO_NVME, &vport->fc_flag);
 				goto out_retry;
 			}
 		}
 		switch (stat.un.b.lsRjtRsnCode) {
 		case LSRJT_UNABLE_TPC:
-			/* The driver has a VALID PLOGI but the rport has
-			 * rejected the PRLI - can't do it now.  Delay
-			 * for 1 second and try again.
-			 *
-			 * However, if explanation is REQ_UNSUPPORTED there's
-			 * no point to retry PRLI.
+			/* Special case for PRLI LS_RJTs. Recall that lpfc
+			 * uses a single routine to issue both PRLI FC4 types.
+			 * If the PRLI is rejected because that FC4 type
+			 * isn't really supported, don't retry and cause
+			 * multiple transport registrations.  Otherwise, parse
+			 * the reason code/reason code explanation and take the
+			 * appropriate action.
 			 */
-			if ((cmd == ELS_CMD_PRLI || cmd == ELS_CMD_NVMEPRLI) &&
-			    stat.un.b.lsRjtRsnCodeExp !=
-			    LSEXP_REQ_UNSUPPORTED) {
-				delay = 1000;
-				maxretry = lpfc_max_els_tries + 1;
+			lpfc_printf_vlog(vport, KERN_INFO,
+					 LOG_DISCOVERY | LOG_ELS | LOG_NODE,
+					 "0153 ELS cmd x%x LS_RJT by x%x. "
+					 "RsnCode x%x RsnCodeExp x%x\n",
+					 cmd, did, stat.un.b.lsRjtRsnCode,
+					 stat.un.b.lsRjtRsnCodeExp);
+
+			switch (stat.un.b.lsRjtRsnCodeExp) {
+			case LSEXP_CANT_GIVE_DATA:
+			case LSEXP_CMD_IN_PROGRESS:
+				if (cmd == ELS_CMD_PLOGI) {
+					delay = 1000;
+					maxretry = 48;
+				}
 				retry = 1;
+				break;
+			case LSEXP_REQ_UNSUPPORTED:
+			case LSEXP_NO_RSRC_ASSIGN:
+				/* These explanation codes get no retry. */
+				if (cmd == ELS_CMD_PRLI ||
+				    cmd == ELS_CMD_NVMEPRLI)
+					break;
+				fallthrough;
+			default:
+				/* Limit the delay and retry action to a limited
+				 * cmd set.  There are other ELS commands where
+				 * a retry is not expected.
+				 */
+				if (cmd == ELS_CMD_PLOGI ||
+				    cmd == ELS_CMD_PRLI ||
+				    cmd == ELS_CMD_NVMEPRLI) {
+					delay = 1000;
+					maxretry = lpfc_max_els_tries + 1;
+					retry = 1;
+				}
 				break;
 			}
 
-			/* Legacy bug fix code for targets with PLOGI delays. */
-			if (stat.un.b.lsRjtRsnCodeExp ==
-			    LSEXP_CMD_IN_PROGRESS) {
-				if (cmd == ELS_CMD_PLOGI) {
-					delay = 1000;
-					maxretry = 48;
-				}
-				retry = 1;
-				break;
-			}
-			if (stat.un.b.lsRjtRsnCodeExp ==
-			    LSEXP_CANT_GIVE_DATA) {
-				if (cmd == ELS_CMD_PLOGI) {
-					delay = 1000;
-					maxretry = 48;
-				}
-				retry = 1;
-				break;
-			}
-			if (cmd == ELS_CMD_PLOGI) {
-				delay = 1000;
-				maxretry = lpfc_max_els_tries + 1;
-				retry = 1;
-				break;
-			}
 			if ((phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) &&
 			  (cmd == ELS_CMD_FDISC) &&
 			  (stat.un.b.lsRjtRsnCodeExp == LSEXP_OUT_OF_RESOURCE)){
-				lpfc_printf_vlog(vport, KERN_ERR,
-						 LOG_TRACE_EVENT,
-						 "0125 FDISC Failed (x%x). "
-						 "Fabric out of resources\n",
-						 stat.un.lsRjtError);
+				lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+					      "0125 FDISC (x%x). "
+					      "Fabric out of resources\n",
+					      stat.un.lsRjtError);
 				lpfc_vport_set_state(vport,
 						     FC_VPORT_NO_FABRIC_RSCS);
 			}
 			break;
 
 		case LSRJT_LOGICAL_BSY:
+			rsn_code_exp = stat.un.b.lsRjtRsnCodeExp;
 			if ((cmd == ELS_CMD_PLOGI) ||
 			    (cmd == ELS_CMD_PRLI) ||
 			    (cmd == ELS_CMD_NVMEPRLI)) {
 				delay = 1000;
 				maxretry = 48;
+
+				/* An authentication LS_RJT reason code
+				 * explanation means some error in the
+				 * security settings end-to-end.  Reduce
+				 * the retry count to allow lpfc to clear
+				 * RSCN mode and not race with dev_loss.
+				 */
+				if (cmd == ELS_CMD_PLOGI &&
+				    rsn_code_exp == LSEXP_AUTH_REQ)
+					maxretry = 8;
 			} else if (cmd == ELS_CMD_FDISC) {
 				/* FDISC retry policy */
 				maxretry = 48;
@@ -4795,11 +4822,24 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 						LSEXP_NOTHING_MORE) {
 				vport->fc_sparam.cmn.bbRcvSizeMsb &= 0xf;
 				retry = 1;
-				lpfc_printf_vlog(vport, KERN_ERR,
-						 LOG_TRACE_EVENT,
-						 "0820 FLOGI Failed (x%x). "
-						 "BBCredit Not Supported\n",
-						 stat.un.lsRjtError);
+				lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+					      "0820 FLOGI (x%x). "
+					      "BBCredit Not Supported\n",
+					      stat.un.lsRjtError);
+			} else if (cmd == ELS_CMD_PLOGI) {
+				rsn_code_exp = stat.un.b.lsRjtRsnCodeExp;
+
+				/* An authentication LS_RJT reason code
+				 * explanation means some error in the
+				 * security settings end-to-end.  Reduce
+				 * the retry count to allow lpfc to clear
+				 * RSCN mode and not race with dev_loss.
+				 */
+				if (rsn_code_exp == LSEXP_AUTH_REQ) {
+					delay = 1000;
+					retry = 1;
+					maxretry = 8;
+				}
 			}
 			break;
 
@@ -4809,11 +4849,10 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			  ((stat.un.b.lsRjtRsnCodeExp == LSEXP_INVALID_PNAME) ||
 			  (stat.un.b.lsRjtRsnCodeExp == LSEXP_INVALID_NPORT_ID))
 			  ) {
-				lpfc_printf_vlog(vport, KERN_ERR,
-						 LOG_TRACE_EVENT,
-						 "0122 FDISC Failed (x%x). "
-						 "Fabric Detected Bad WWN\n",
-						 stat.un.lsRjtError);
+				lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+					      "0122 FDISC (x%x). "
+					      "Fabric Detected Bad WWN\n",
+					      stat.un.lsRjtError);
 				lpfc_vport_set_state(vport,
 						     FC_VPORT_FABRIC_REJ_WWN);
 			}
@@ -4832,13 +4871,8 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			 */
 			if (stat.un.b.lsRjtRsnCodeExp ==
 			    LSEXP_REQ_UNSUPPORTED) {
-				if (cmd == ELS_CMD_PRLI) {
-					spin_lock_irq(&ndlp->lock);
-					ndlp->nlp_flag |= NLP_FCP_PRLI_RJT;
-					spin_unlock_irq(&ndlp->lock);
-					retry = 0;
+				if (cmd == ELS_CMD_PRLI)
 					goto out_retry;
-				}
 			}
 			break;
 		}
@@ -4870,7 +4904,7 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 	if ((cmd == ELS_CMD_FLOGI) &&
 	    (phba->fc_topology != LPFC_TOPOLOGY_LOOP) &&
-	    !lpfc_error_lost_link(ulp_status, ulp_word4)) {
+	    !lpfc_error_lost_link(vport, ulp_status, ulp_word4)) {
 		/* FLOGI retry policy */
 		retry = 1;
 		/* retry FLOGI forever */
@@ -4884,7 +4918,7 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		else if (cmdiocb->retry >= 32)
 			delay = 1000;
 	} else if ((cmd == ELS_CMD_FDISC) &&
-	    !lpfc_error_lost_link(ulp_status, ulp_word4)) {
+	    !lpfc_error_lost_link(vport, ulp_status, ulp_word4)) {
 		/* retry FDISCs every second up to devloss */
 		retry = 1;
 		maxretry = vport->cfg_devloss_tmo;
@@ -4897,7 +4931,7 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		retry = 0;
 	}
 
-	if ((vport->load_flag & FC_UNLOADING) != 0)
+	if (test_bit(FC_UNLOADING, &vport->load_flag))
 		retry = 0;
 
 out_retry:
@@ -4928,7 +4962,7 @@ out_retry:
 
 			/* If discovery / RSCN timer is running, reset it */
 			if (timer_pending(&vport->fc_disctmo) ||
-			    (vport->fc_flag & FC_RSCN_MODE))
+			    test_bit(FC_RSCN_MODE, &vport->fc_flag))
 				lpfc_set_disctmo(vport);
 		}
 
@@ -4940,9 +4974,7 @@ out_retry:
 			/* delay is specified in milliseconds */
 			mod_timer(&ndlp->nlp_delayfunc,
 				jiffies + msecs_to_jiffies(delay));
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_flag |= NLP_DELAY_TMO;
-			spin_unlock_irq(&ndlp->lock);
+			set_bit(NLP_DELAY_TMO, &ndlp->nlp_flag);
 
 			ndlp->nlp_prev_state = ndlp->nlp_state;
 			if ((cmd == ELS_CMD_PRLI) ||
@@ -4993,16 +5025,19 @@ out_retry:
 	if (logerr) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 			 "0137 No retry ELS command x%x to remote "
-			 "NPORT x%x: Out of Resources: Error:x%x/%x\n",
-			 cmd, did, ulp_status,
-			 ulp_word4);
+			 "NPORT x%x: Out of Resources: Error:x%x/%x "
+			 "IoTag x%x\n",
+			 cmd, did, ulp_status, ulp_word4,
+			 cmdiocb->iotag);
 	}
 	else {
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
-			 "0108 No retry ELS command x%x to remote "
-			 "NPORT x%x Retried:%d Error:x%x/%x\n",
-			 cmd, did, cmdiocb->retry, ulp_status,
-			 ulp_word4);
+				 "0108 No retry ELS command x%x to remote "
+				 "NPORT x%x Retried:%d Error:x%x/%x "
+				 "IoTag x%x nflags x%lx\n",
+				 cmd, did, cmdiocb->retry, ulp_status,
+				 ulp_word4, cmdiocb->iotag,
+				 (ndlp ? ndlp->nlp_flag : 0));
 	}
 	return 0;
 }
@@ -5068,10 +5103,10 @@ lpfc_els_free_bpl(struct lpfc_hba *phba, struct lpfc_dmabuf *buf_ptr)
  * command IOCB data structure contains the reference to various associated
  * resources, these fields must be set to NULL if the associated reference
  * not present:
- *   context1 - reference to ndlp
- *   context2 - reference to cmd
- *   context2->next - reference to rsp
- *   context3 - reference to bpl
+ *   cmd_dmabuf - reference to cmd.
+ *   cmd_dmabuf->next - reference to rsp
+ *   rsp_dmabuf - unused
+ *   bpl_dmabuf - reference to bpl
  *
  * It first properly decrements the reference count held on ndlp for the
  * IOCB completion callback function. If LPFC_DELAY_MEM_FREE flag is not
@@ -5091,19 +5126,19 @@ lpfc_els_free_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *elsiocb)
 {
 	struct lpfc_dmabuf *buf_ptr, *buf_ptr1;
 
-	/* The I/O iocb is complete.  Clear the context1 data. */
-	elsiocb->context1 = NULL;
+	/* The I/O iocb is complete.  Clear the node and first dmbuf */
+	elsiocb->ndlp = NULL;
 
-	/* context2  = cmd,  context2->next = rsp, context3 = bpl */
-	if (elsiocb->context2) {
+	/* cmd_dmabuf = cmd,  cmd_dmabuf->next = rsp, bpl_dmabuf = bpl */
+	if (elsiocb->cmd_dmabuf) {
 		if (elsiocb->cmd_flag & LPFC_DELAY_MEM_FREE) {
 			/* Firmware could still be in progress of DMAing
 			 * payload, so don't free data buffer till after
 			 * a hbeat.
 			 */
 			elsiocb->cmd_flag &= ~LPFC_DELAY_MEM_FREE;
-			buf_ptr = elsiocb->context2;
-			elsiocb->context2 = NULL;
+			buf_ptr = elsiocb->cmd_dmabuf;
+			elsiocb->cmd_dmabuf = NULL;
 			if (buf_ptr) {
 				buf_ptr1 = NULL;
 				spin_lock_irq(&phba->hbalock);
@@ -5122,16 +5157,16 @@ lpfc_els_free_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *elsiocb)
 				spin_unlock_irq(&phba->hbalock);
 			}
 		} else {
-			buf_ptr1 = (struct lpfc_dmabuf *) elsiocb->context2;
+			buf_ptr1 = elsiocb->cmd_dmabuf;
 			lpfc_els_free_data(phba, buf_ptr1);
-			elsiocb->context2 = NULL;
+			elsiocb->cmd_dmabuf = NULL;
 		}
 	}
 
-	if (elsiocb->context3) {
-		buf_ptr = (struct lpfc_dmabuf *) elsiocb->context3;
+	if (elsiocb->bpl_dmabuf) {
+		buf_ptr = elsiocb->bpl_dmabuf;
 		lpfc_els_free_bpl(phba, buf_ptr);
-		elsiocb->context3 = NULL;
+		elsiocb->bpl_dmabuf = NULL;
 	}
 	lpfc_sli_release_iocbq(phba, elsiocb);
 	return 0;
@@ -5145,20 +5180,15 @@ lpfc_els_free_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *elsiocb)
  *
  * This routine is the completion callback function to the Logout (LOGO)
  * Accept (ACC) Response ELS command. This routine is invoked to indicate
- * the completion of the LOGO process. It invokes the lpfc_nlp_not_used() to
- * release the ndlp if it has the last reference remaining (reference count
- * is 1). If succeeded (meaning ndlp released), it sets the IOCB context1
- * field to NULL to inform the following lpfc_els_free_iocb() routine no
- * ndlp reference count needs to be decremented. Otherwise, the ndlp
- * reference use-count shall be decremented by the lpfc_els_free_iocb()
- * routine. Finally, the lpfc_els_free_iocb() is invoked to release the
- * IOCB data structure.
+ * the completion of the LOGO process. If the node has transitioned to NPR,
+ * this routine unregisters the RPI if it is still registered. The
+ * lpfc_els_free_iocb() is invoked to release the IOCB data structure.
  **/
 static void
 lpfc_cmpl_els_logo_acc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		       struct lpfc_iocbq *rspiocb)
 {
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	struct lpfc_vport *vport = cmdiocb->vport;
 	u32 ulp_status, ulp_word4;
 
@@ -5171,9 +5201,10 @@ lpfc_cmpl_els_logo_acc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* ACC to LOGO completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0109 ACC to LOGO completes to NPort x%x refcnt %d "
-			 "Data: x%x x%x x%x\n",
-			 ndlp->nlp_DID, kref_read(&ndlp->kref), ndlp->nlp_flag,
-			 ndlp->nlp_state, ndlp->nlp_rpi);
+			 "last els x%x Data: x%lx x%x x%x\n",
+			 ndlp->nlp_DID, kref_read(&ndlp->kref),
+			 ndlp->nlp_last_elscmd, ndlp->nlp_flag, ndlp->nlp_state,
+			 ndlp->nlp_rpi);
 
 	/* This clause allows the LOGO ACC to complete and free resources
 	 * for the Fabric Domain Controller.  It does deliberately skip
@@ -5185,28 +5216,20 @@ lpfc_cmpl_els_logo_acc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		goto out;
 
 	if (ndlp->nlp_state == NLP_STE_NPR_NODE) {
-		/* If PLOGI is being retried, PLOGI completion will cleanup the
-		 * node. The NLP_NPR_2B_DISC flag needs to be retained to make
-		 * progress on nodes discovered from last RSCN.
-		 */
-		if ((ndlp->nlp_flag & NLP_DELAY_TMO) &&
-		    (ndlp->nlp_last_elscmd == ELS_CMD_PLOGI))
-			goto out;
-
-		/* NPort Recovery mode or node is just allocated */
-		if (!lpfc_nlp_not_used(ndlp)) {
-			/* A LOGO is completing and the node is in NPR state.
-			 * Just unregister the RPI because the node is still
-			 * required.
-			 */
+		if (test_bit(NLP_RPI_REGISTERED, &ndlp->nlp_flag))
 			lpfc_unreg_rpi(vport, ndlp);
-		} else {
-			/* Indicate the node has already released, should
-			 * not reference to it from within lpfc_els_free_iocb.
-			 */
-			cmdiocb->context1 = NULL;
+
+		/* If came from PRLO, then PRLO_ACC is done.
+		 * Start rediscovery now.
+		 */
+		if (ndlp->nlp_last_elscmd == ELS_CMD_PRLO) {
+			set_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag);
+			ndlp->nlp_prev_state = ndlp->nlp_state;
+			lpfc_nlp_set_state(vport, ndlp, NLP_STE_PLOGI_ISSUE);
+			lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
 		}
 	}
+
  out:
 	/*
 	 * The driver received a LOGO from the rport and has ACK'd it.
@@ -5225,24 +5248,19 @@ lpfc_cmpl_els_logo_acc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
  * RPI (Remote Port Index) mailbox command to the @phba. It simply releases
  * the associated lpfc Direct Memory Access (DMA) buffer back to the pool and
  * decrements the ndlp reference count held for this completion callback
- * function. After that, it invokes the lpfc_nlp_not_used() to check
- * whether there is only one reference left on the ndlp. If so, it will
- * perform one more decrement and trigger the release of the ndlp.
+ * function. After that, it invokes the lpfc_drop_node to check
+ * whether it is appropriate to release the node.
  **/
 void
 lpfc_mbx_cmpl_dflt_rpi(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 {
-	struct lpfc_dmabuf *mp = (struct lpfc_dmabuf *)(pmb->ctx_buf);
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *)pmb->ctx_ndlp;
+	struct lpfc_nodelist *ndlp = pmb->ctx_ndlp;
 	u32 mbx_flag = pmb->mbox_flag;
 	u32 mbx_cmd = pmb->u.mb.mbxCommand;
 
-	pmb->ctx_buf = NULL;
-	pmb->ctx_ndlp = NULL;
-
 	if (ndlp) {
 		lpfc_printf_vlog(ndlp->vport, KERN_INFO, LOG_NODE,
-				 "0006 rpi x%x DID:%x flg:%x %d x%px "
+				 "0006 rpi x%x DID:%x flg:%lx %d x%px "
 				 "mbx_cmd x%x mbx_flag x%x x%px\n",
 				 ndlp->nlp_rpi, ndlp->nlp_DID, ndlp->nlp_flag,
 				 kref_read(&ndlp->kref), ndlp, mbx_cmd,
@@ -5253,19 +5271,14 @@ lpfc_mbx_cmpl_dflt_rpi(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 		 * first on an UNREG_LOGIN and then release the final
 		 * references.
 		 */
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag &= ~NLP_REG_LOGIN_SEND;
+		clear_bit(NLP_REG_LOGIN_SEND, &ndlp->nlp_flag);
 		if (mbx_cmd == MBX_UNREG_LOGIN)
-			ndlp->nlp_flag &= ~NLP_UNREG_INP;
-		spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_UNREG_INP, &ndlp->nlp_flag);
 		lpfc_nlp_put(ndlp);
 		lpfc_drop_node(ndlp->vport, ndlp);
 	}
 
-	lpfc_mbuf_free(phba, mp->virt, mp->phys);
-	kfree(mp);
-	mempool_free(pmb, phba->mbox_mem_pool);
-	return;
+	lpfc_mbox_rsrc_cleanup(phba, pmb, MBOX_THD_UNLOCKED);
 }
 
 /**
@@ -5285,17 +5298,16 @@ static void
 lpfc_cmpl_els_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		  struct lpfc_iocbq *rspiocb)
 {
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	struct lpfc_vport *vport = ndlp ? ndlp->vport : NULL;
 	struct Scsi_Host  *shost = vport ? lpfc_shost_from_vport(vport) : NULL;
 	IOCB_t  *irsp;
 	LPFC_MBOXQ_t *mbox = NULL;
-	struct lpfc_dmabuf *mp = NULL;
 	u32 ulp_status, ulp_word4, tmo, did, iotag;
 
 	if (!vport) {
-		lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
-				"3177 ELS response failed\n");
+		lpfc_printf_log(phba, KERN_WARNING, LOG_ELS,
+				"3177 null vport in ELS rsp\n");
 		goto out;
 	}
 	if (cmdiocb->context_un.mbox)
@@ -5316,14 +5328,8 @@ lpfc_cmpl_els_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 	/* Check to see if link went down during discovery */
 	if (!ndlp || lpfc_els_chk_latt(vport)) {
-		if (mbox) {
-			mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
-			if (mp) {
-				lpfc_mbuf_free(phba, mp->virt, mp->phys);
-				kfree(mp);
-			}
-			mempool_free(mbox, phba->mbox_mem_pool);
-		}
+		if (mbox)
+			lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
 		goto out;
 	}
 
@@ -5333,35 +5339,28 @@ lpfc_cmpl_els_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* ELS response tag <ulpIoTag> completes */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0110 ELS response tag x%x completes "
-			 "Data: x%x x%x x%x x%x x%x x%x x%x x%x %p %p\n",
+			 "Data: x%x x%x x%x x%x x%lx x%x x%x x%x %p %p\n",
 			 iotag, ulp_status, ulp_word4, tmo,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi, kref_read(&ndlp->kref), mbox, ndlp);
 	if (mbox) {
-		if (ulp_status == 0
-		    && (ndlp->nlp_flag & NLP_ACC_REGLOGIN)) {
+		if (ulp_status == 0 &&
+		    test_bit(NLP_ACC_REGLOGIN, &ndlp->nlp_flag)) {
 			if (!lpfc_unreg_rpi(vport, ndlp) &&
-			    (!(vport->fc_flag & FC_PT2PT))) {
-				if (ndlp->nlp_state ==  NLP_STE_PLOGI_ISSUE ||
+			    !test_bit(FC_PT2PT, &vport->fc_flag)) {
+				if (ndlp->nlp_state == NLP_STE_PLOGI_ISSUE ||
 				    ndlp->nlp_state ==
 				     NLP_STE_REG_LOGIN_ISSUE) {
 					lpfc_printf_vlog(vport, KERN_INFO,
 							 LOG_DISCOVERY,
 							 "0314 PLOGI recov "
 							 "DID x%x "
-							 "Data: x%x x%x x%x\n",
+							 "Data: x%x x%x x%lx\n",
 							 ndlp->nlp_DID,
 							 ndlp->nlp_state,
 							 ndlp->nlp_rpi,
 							 ndlp->nlp_flag);
-					mp = mbox->ctx_buf;
-					if (mp) {
-						lpfc_mbuf_free(phba, mp->virt,
-							       mp->phys);
-						kfree(mp);
-					}
-					mempool_free(mbox, phba->mbox_mem_pool);
-					goto out;
+					goto out_free_mbox;
 				}
 			}
 
@@ -5370,21 +5369,20 @@ lpfc_cmpl_els_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			 */
 			mbox->ctx_ndlp = lpfc_nlp_get(ndlp);
 			if (!mbox->ctx_ndlp)
-				goto out;
+				goto out_free_mbox;
 
 			mbox->vport = vport;
-			if (ndlp->nlp_flag & NLP_RM_DFLT_RPI) {
+			if (test_bit(NLP_RM_DFLT_RPI, &ndlp->nlp_flag)) {
 				mbox->mbox_flag |= LPFC_MBX_IMED_UNREG;
 				mbox->mbox_cmpl = lpfc_mbx_cmpl_dflt_rpi;
-			}
-			else {
+			} else {
 				mbox->mbox_cmpl = lpfc_mbx_cmpl_reg_login;
 				ndlp->nlp_prev_state = ndlp->nlp_state;
 				lpfc_nlp_set_state(vport, ndlp,
 					   NLP_STE_REG_LOGIN_ISSUE);
 			}
 
-			ndlp->nlp_flag |= NLP_REG_LOGIN_SEND;
+			set_bit(NLP_REG_LOGIN_SEND, &ndlp->nlp_flag);
 			if (lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT)
 			    != MBX_NOT_FINISHED)
 				goto out;
@@ -5393,45 +5391,41 @@ lpfc_cmpl_els_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			 * set for this failed mailbox command.
 			 */
 			lpfc_nlp_put(ndlp);
-			ndlp->nlp_flag &= ~NLP_REG_LOGIN_SEND;
+			clear_bit(NLP_REG_LOGIN_SEND, &ndlp->nlp_flag);
 
 			/* ELS rsp: Cannot issue reg_login for <NPortid> */
 			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 				"0138 ELS rsp: Cannot issue reg_login for x%x "
-				"Data: x%x x%x x%x\n",
+				"Data: x%lx x%x x%x\n",
 				ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 				ndlp->nlp_rpi);
 		}
-		mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
-		if (mp) {
-			lpfc_mbuf_free(phba, mp->virt, mp->phys);
-			kfree(mp);
-		}
-		mempool_free(mbox, phba->mbox_mem_pool);
+out_free_mbox:
+		lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
 	}
 out:
 	if (ndlp && shost) {
-		spin_lock_irq(&ndlp->lock);
 		if (mbox)
-			ndlp->nlp_flag &= ~NLP_ACC_REGLOGIN;
-		ndlp->nlp_flag &= ~NLP_RM_DFLT_RPI;
-		spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_ACC_REGLOGIN, &ndlp->nlp_flag);
+		clear_bit(NLP_RM_DFLT_RPI, &ndlp->nlp_flag);
 	}
 
 	/* An SLI4 NPIV instance wants to drop the node at this point under
-	 * these conditions and release the RPI.
+	 * these conditions because it doesn't need the login.
 	 */
 	if (phba->sli_rev == LPFC_SLI_REV4 &&
-	    (vport && vport->port_type == LPFC_NPIV_PORT) &&
-	    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD) &&
-	    ndlp->nlp_flag & NLP_RELEASE_RPI) {
-		if (ndlp->nlp_state !=  NLP_STE_PLOGI_ISSUE &&
-		    ndlp->nlp_state != NLP_STE_REG_LOGIN_ISSUE) {
-			lpfc_sli4_free_rpi(phba, ndlp->nlp_rpi);
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_rpi = LPFC_RPI_ALLOC_ERROR;
-			ndlp->nlp_flag &= ~NLP_RELEASE_RPI;
-			spin_unlock_irq(&ndlp->lock);
+	    vport && vport->port_type == LPFC_NPIV_PORT &&
+	    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD)) {
+		if (ndlp->nlp_state != NLP_STE_PLOGI_ISSUE &&
+		    ndlp->nlp_state != NLP_STE_REG_LOGIN_ISSUE &&
+		    ndlp->nlp_state != NLP_STE_PRLI_ISSUE) {
+			/* Drop ndlp if there is no planned or outstanding
+			 * issued PRLI.
+			 *
+			 * In cases when the ndlp is acting as both an initiator
+			 * and target function, let our issued PRLI determine
+			 * the final ndlp kref drop.
+			 */
 			lpfc_drop_node(vport, ndlp);
 		}
 	}
@@ -5459,7 +5453,7 @@ out:
  * mailbox command to the HBA later when callback is invoked.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the corresponding
  * response ELS IOCB command.
  *
@@ -5491,9 +5485,7 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 		elsiocb = lpfc_prep_els_iocb(vport, 0, cmdsize, oldiocb->retry,
 					     ndlp, ndlp->nlp_DID, ELS_CMD_ACC);
 		if (!elsiocb) {
-			spin_lock_irq(&ndlp->lock);
-			ndlp->nlp_flag &= ~NLP_LOGO_ACC;
-			spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_LOGO_ACC, &ndlp->nlp_flag);
 			return 1;
 		}
 
@@ -5516,12 +5508,12 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 				oldcmd->unsli3.rcvsli3.ox_id;
 		}
 
-		pcmd = (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+		pcmd = elsiocb->cmd_dmabuf->virt;
 		*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 		pcmd += sizeof(uint32_t);
 
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-			"Issue ACC:       did:x%x flg:x%x",
+			"Issue ACC:       did:x%x flg:x%lx",
 			ndlp->nlp_DID, ndlp->nlp_flag, 0);
 		break;
 	case ELS_CMD_FLOGI:
@@ -5551,7 +5543,7 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 				oldcmd->unsli3.rcvsli3.ox_id;
 		}
 
-		pcmd = (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+		pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
 
 		if (mbox)
 			elsiocb->context_un.mbox = mbox;
@@ -5600,7 +5592,7 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 		}
 
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-			"Issue ACC FLOGI/PLOGI: did:x%x flg:x%x",
+			"Issue ACC FLOGI/PLOGI: did:x%x flg:x%lx",
 			ndlp->nlp_DID, ndlp->nlp_flag, 0);
 		break;
 	case ELS_CMD_PRLO:
@@ -5629,16 +5621,16 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 				oldcmd->unsli3.rcvsli3.ox_id;
 		}
 
-		pcmd = (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+		pcmd = (u8 *) elsiocb->cmd_dmabuf->virt;
 
-		memcpy(pcmd, ((struct lpfc_dmabuf *) oldiocb->context2)->virt,
+		memcpy(pcmd, oldiocb->cmd_dmabuf->virt,
 		       sizeof(uint32_t) + sizeof(PRLO));
 		*((uint32_t *) (pcmd)) = ELS_CMD_PRLO_ACC;
 		els_pkt_ptr = (ELS_PKT *) pcmd;
 		els_pkt_ptr->un.prlo.acceptRspCode = PRLO_REQ_EXECUTED;
 
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-			"Issue ACC PRLO:  did:x%x flg:x%x",
+			"Issue ACC PRLO:  did:x%x flg:x%lx",
 			ndlp->nlp_DID, ndlp->nlp_flag, 0);
 		break;
 	case ELS_CMD_RDF:
@@ -5667,7 +5659,7 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 				oldcmd->unsli3.rcvsli3.ox_id;
 		}
 
-		pcmd = (((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+		pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
 		rdf_resp = (struct fc_els_rdf_resp *)pcmd;
 		memset(rdf_resp, 0, sizeof(*rdf_resp));
 		rdf_resp->acc_hdr.la_cmd = ELS_LS_ACC;
@@ -5683,20 +5675,18 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 	default:
 		return 1;
 	}
-	if (ndlp->nlp_flag & NLP_LOGO_ACC) {
-		spin_lock_irq(&ndlp->lock);
-		if (!(ndlp->nlp_flag & NLP_RPI_REGISTERED ||
-			ndlp->nlp_flag & NLP_REG_LOGIN_SEND))
-			ndlp->nlp_flag &= ~NLP_LOGO_ACC;
-		spin_unlock_irq(&ndlp->lock);
+	if (test_bit(NLP_LOGO_ACC, &ndlp->nlp_flag)) {
+		if (!test_bit(NLP_RPI_REGISTERED, &ndlp->nlp_flag) &&
+		    !test_bit(NLP_REG_LOGIN_SEND, &ndlp->nlp_flag))
+			clear_bit(NLP_LOGO_ACC, &ndlp->nlp_flag);
 		elsiocb->cmd_cmpl = lpfc_cmpl_els_logo_acc;
 	} else {
 		elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	}
 
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -5711,8 +5701,8 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
 	/* Xmit ELS ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0128 Xmit ELS ACC response Status: x%x, IoTag: x%x, "
-			 "XRI: x%x, DID: x%x, nlp_flag: x%x nlp_state: x%x "
-			 "RPI: x%x, fc_flag x%x refcnt %d\n",
+			 "XRI: x%x, DID: x%x, nlp_flag: x%lx nlp_state: x%x "
+			 "RPI: x%x, fc_flag x%lx refcnt %d\n",
 			 rc, elsiocb->iotag, elsiocb->sli4_xritag,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi, vport->fc_flag, kref_read(&ndlp->kref));
@@ -5733,7 +5723,7 @@ lpfc_els_rsp_acc(struct lpfc_vport *vport, uint32_t flag,
  * to issue to the HBA later.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the reject response
  * ELS IOCB command.
  *
@@ -5774,7 +5764,7 @@ lpfc_els_rsp_reject(struct lpfc_vport *vport, uint32_t rejectError,
 		icmd->unsli3.rcvsli3.ox_id = oldcmd->unsli3.rcvsli3.ox_id;
 	}
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *) (pcmd)) = ELS_CMD_LS_RJT;
 	pcmd += sizeof(uint32_t);
@@ -5786,33 +5776,21 @@ lpfc_els_rsp_reject(struct lpfc_vport *vport, uint32_t rejectError,
 	/* Xmit ELS RJT <err> response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0129 Xmit ELS RJT x%x response tag x%x "
-			 "xri x%x, did x%x, nlp_flag x%x, nlp_state x%x, "
+			 "xri x%x, did x%x, nlp_flag x%lx, nlp_state x%x, "
 			 "rpi x%x\n",
 			 rejectError, elsiocb->iotag,
 			 get_job_ulpcontext(phba, elsiocb), ndlp->nlp_DID,
 			 ndlp->nlp_flag, ndlp->nlp_state, ndlp->nlp_rpi);
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		"Issue LS_RJT:    did:x%x flg:x%x err:x%x",
+		"Issue LS_RJT:    did:x%x flg:x%lx err:x%x",
 		ndlp->nlp_DID, ndlp->nlp_flag, rejectError);
 
 	phba->fc_stat.elsXmitLSRJT++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
-	}
-
-	/* The NPIV instance is rejecting this unsolicited ELS. Make sure the
-	 * node's assigned RPI gets released provided this node is not already
-	 * registered with the transport.
-	 */
-	if (phba->sli_rev == LPFC_SLI_REV4 &&
-	    vport->port_type == LPFC_NPIV_PORT &&
-	    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD)) {
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag |= NLP_RELEASE_RPI;
-		spin_unlock_irq(&ndlp->lock);
 	}
 
 	rc = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, elsiocb, 0);
@@ -5844,14 +5822,21 @@ lpfc_issue_els_edc_rsp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		       struct lpfc_nodelist *ndlp)
 {
 	struct lpfc_hba  *phba = vport->phba;
-	struct lpfc_els_edc_rsp *edc_rsp;
+	struct fc_els_edc_resp *edc_rsp;
+	struct fc_tlv_desc *tlv;
 	struct lpfc_iocbq *elsiocb;
 	IOCB_t *icmd, *cmd;
 	union lpfc_wqe128 *wqe;
+	u32 cgn_desc_size, lft_desc_size;
+	u16 cmdsize;
 	uint8_t *pcmd;
-	int cmdsize, rc;
+	int rc;
 
-	cmdsize = sizeof(struct lpfc_els_edc_rsp);
+	cmdsize = sizeof(struct fc_els_edc_resp);
+	cgn_desc_size = sizeof(struct fc_diag_cg_sig_desc);
+	lft_desc_size = (lpfc_link_is_lds_capable(phba)) ?
+				sizeof(struct fc_diag_lnkflt_desc) : 0;
+	cmdsize += cgn_desc_size + lft_desc_size;
 	elsiocb = lpfc_prep_els_iocb(vport, 0, cmdsize, cmdiocb->retry,
 				     ndlp, ndlp->nlp_DID, ELS_CMD_ACC);
 	if (!elsiocb)
@@ -5870,29 +5855,32 @@ lpfc_issue_els_edc_rsp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		icmd->unsli3.rcvsli3.ox_id = cmd->unsli3.rcvsli3.ox_id;
 	}
 
-	pcmd = (((struct lpfc_dmabuf *)elsiocb->context2)->virt);
-
+	pcmd = elsiocb->cmd_dmabuf->virt;
 	memset(pcmd, 0, cmdsize);
 
-	edc_rsp = (struct lpfc_els_edc_rsp *)pcmd;
-	edc_rsp->edc_rsp.acc_hdr.la_cmd = ELS_LS_ACC;
-	edc_rsp->edc_rsp.desc_list_len = cpu_to_be32(
-		FC_TLV_DESC_LENGTH_FROM_SZ(struct lpfc_els_edc_rsp));
-	edc_rsp->edc_rsp.lsri.desc_tag = cpu_to_be32(ELS_DTAG_LS_REQ_INFO);
-	edc_rsp->edc_rsp.lsri.desc_len = cpu_to_be32(
+	edc_rsp = (struct fc_els_edc_resp *)pcmd;
+	edc_rsp->acc_hdr.la_cmd = ELS_LS_ACC;
+	edc_rsp->desc_list_len = cpu_to_be32(sizeof(struct fc_els_lsri_desc) +
+						cgn_desc_size + lft_desc_size);
+	edc_rsp->lsri.desc_tag = cpu_to_be32(ELS_DTAG_LS_REQ_INFO);
+	edc_rsp->lsri.desc_len = cpu_to_be32(
 		FC_TLV_DESC_LENGTH_FROM_SZ(struct fc_els_lsri_desc));
-	edc_rsp->edc_rsp.lsri.rqst_w0.cmd = ELS_EDC;
-	lpfc_format_edc_cgn_desc(phba, &edc_rsp->cgn_desc);
+	edc_rsp->lsri.rqst_w0.cmd = ELS_EDC;
+	tlv = edc_rsp->desc;
+	lpfc_format_edc_cgn_desc(phba, tlv);
+	tlv = fc_tlv_next_desc(tlv);
+	if (lft_desc_size)
+		lpfc_format_edc_lft_desc(phba, tlv);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-			      "Issue EDC ACC:      did:x%x flg:x%x refcnt %d",
+			      "Issue EDC ACC:      did:x%x flg:x%lx refcnt %d",
 			      ndlp->nlp_DID, ndlp->nlp_flag,
 			      kref_read(&ndlp->kref));
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -5907,8 +5895,8 @@ lpfc_issue_els_edc_rsp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	/* Xmit ELS ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0152 Xmit EDC ACC response Status: x%x, IoTag: x%x, "
-			 "XRI: x%x, DID: x%x, nlp_flag: x%x nlp_state: x%x "
-			 "RPI: x%x, fc_flag x%x\n",
+			 "XRI: x%x, DID: x%x, nlp_flag: x%lx nlp_state: x%x "
+			 "RPI: x%x, fc_flag x%lx\n",
 			 rc, elsiocb->iotag, elsiocb->sli4_xritag,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi, vport->fc_flag);
@@ -5927,7 +5915,7 @@ lpfc_issue_els_edc_rsp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
  * and invokes the lpfc_sli_issue_iocb() routine to send out the command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the ADISC Accept response
  * ELS IOCB command.
  *
@@ -5976,11 +5964,11 @@ lpfc_els_rsp_adisc_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 	/* Xmit ADISC ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0130 Xmit ADISC ACC response iotag x%x xri: "
-			 "x%x, did x%x, nlp_flag x%x, nlp_state x%x rpi x%x\n",
+			 "x%x, did x%x, nlp_flag x%lx, nlp_state x%x rpi x%x\n",
 			 elsiocb->iotag, ulp_context,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi);
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint32_t);
@@ -5992,13 +5980,13 @@ lpfc_els_rsp_adisc_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 	ap->DID = be32_to_cpu(vport->fc_myDID);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		      "Issue ACC ADISC: did:x%x flg:x%x refcnt %d",
+		      "Issue ACC ADISC: did:x%x flg:x%lx refcnt %d",
 		      ndlp->nlp_DID, ndlp->nlp_flag, kref_read(&ndlp->kref));
 
 	phba->fc_stat.elsXmitACC++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -6024,7 +6012,7 @@ lpfc_els_rsp_adisc_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
  * and invokes the lpfc_sli_issue_iocb() routine to send out the command.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the PRLI Accept response
  * ELS IOCB command.
  *
@@ -6054,7 +6042,7 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 	/* Need the incoming PRLI payload to determine if the ACC is for an
 	 * FC4 or NVME PRLI type.  The PRLI type is at word 1.
 	 */
-	req_buf = (struct lpfc_dmabuf *)oldiocb->context2;
+	req_buf = oldiocb->cmd_dmabuf;
 	req_payload = (((uint32_t *)req_buf->virt) + 1);
 
 	/* PRLI type payload is at byte 3 for FCP or NVME. */
@@ -6067,7 +6055,7 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 	if (prli_fc4_req == PRLI_FCP_TYPE) {
 		cmdsize = sizeof(uint32_t) + sizeof(PRLI);
 		elsrspcmd = (ELS_CMD_ACC | (ELS_CMD_PRLI & ~ELS_RSP_MASK));
-	} else if (prli_fc4_req & PRLI_NVME_TYPE) {
+	} else if (prli_fc4_req == PRLI_NVME_TYPE) {
 		cmdsize = sizeof(uint32_t) + sizeof(struct lpfc_nvme_prli);
 		elsrspcmd = (ELS_CMD_ACC | (ELS_CMD_NVMEPRLI & ~ELS_RSP_MASK));
 	} else {
@@ -6098,11 +6086,11 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 	/* Xmit PRLI ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0131 Xmit PRLI ACC response tag x%x xri x%x, "
-			 "did x%x, nlp_flag x%x, nlp_state x%x, rpi x%x\n",
+			 "did x%x, nlp_flag x%lx, nlp_state x%x, rpi x%x\n",
 			 elsiocb->iotag, ulp_context,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi);
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	memset(pcmd, 0, cmdsize);
 
 	*((uint32_t *)(pcmd)) = elsrspcmd;
@@ -6125,12 +6113,26 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 			npr->TaskRetryIdReq = 1;
 		}
 		npr->acceptRspCode = PRLI_REQ_EXECUTED;
-		npr->estabImagePair = 1;
+
+		/* Set image pair for complementary pairs only. */
+		if (ndlp->nlp_type & NLP_FCP_TARGET)
+			npr->estabImagePair = 1;
+		else
+			npr->estabImagePair = 0;
 		npr->readXferRdyDis = 1;
 		npr->ConfmComplAllowed = 1;
 		npr->prliType = PRLI_FCP_TYPE;
 		npr->initiatorFunc = 1;
-	} else if (prli_fc4_req & PRLI_NVME_TYPE) {
+
+		/* Xmit PRLI ACC response tag <ulpIoTag> */
+		lpfc_printf_vlog(vport, KERN_INFO,
+				 LOG_ELS | LOG_NODE | LOG_DISCOVERY,
+				 "6014 FCP issue PRLI ACC imgpair %d "
+				 "retry %d task %d\n",
+				 npr->estabImagePair,
+				 npr->Retry, npr->TaskRetryIdReq);
+
+	} else if (prli_fc4_req == PRLI_NVME_TYPE) {
 		/* Respond with an NVME PRLI Type */
 		npr_nvme = (struct lpfc_nvme_prli *) pcmd;
 		bf_set(prli_type_code, npr_nvme, PRLI_NVME_TYPE);
@@ -6155,7 +6157,7 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_NVME_DISC,
 				 "6015 NVME issue PRLI ACC word1 x%08x "
-				 "word4 x%08x word5 x%08x flag x%x, "
+				 "word4 x%08x word5 x%08x flag x%lx, "
 				 "fcp_info x%x nlp_type x%x\n",
 				 npr_nvme->word1, npr_nvme->word4,
 				 npr_nvme->word5, ndlp->nlp_flag,
@@ -6170,13 +6172,13 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 				 ndlp->nlp_DID);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		      "Issue ACC PRLI:  did:x%x flg:x%x",
+		      "Issue ACC PRLI:  did:x%x flg:x%lx",
 		      ndlp->nlp_DID, ndlp->nlp_flag, kref_read(&ndlp->kref));
 
 	phba->fc_stat.elsXmitACC++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 =  lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp =  lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -6204,7 +6206,7 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
  * issue the response.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function.
  *
  * Return code
@@ -6255,7 +6257,7 @@ lpfc_els_rsp_rnid_acc(struct lpfc_vport *vport, uint8_t format,
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0132 Xmit RNID ACC response tag x%x xri x%x\n",
 			 elsiocb->iotag, ulp_context);
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint32_t);
 
@@ -6284,13 +6286,13 @@ lpfc_els_rsp_rnid_acc(struct lpfc_vport *vport, uint8_t format,
 	}
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		      "Issue ACC RNID:  did:x%x flg:x%x refcnt %d",
+		      "Issue ACC RNID:  did:x%x flg:x%lx refcnt %d",
 		      ndlp->nlp_DID, ndlp->nlp_flag, kref_read(&ndlp->kref));
 
 	phba->fc_stat.elsXmitACC++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -6325,7 +6327,7 @@ lpfc_els_clear_rrq(struct lpfc_vport *vport,
 	struct lpfc_node_rrq *prrq;
 
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) iocb->context2)->virt);
+	pcmd = (uint8_t *)iocb->cmd_dmabuf->virt;
 	pcmd += sizeof(uint32_t);
 	rrq = (struct RRQ *)pcmd;
 	rrq->rrq_exchg = be32_to_cpu(rrq->rrq_exchg);
@@ -6341,7 +6343,7 @@ lpfc_els_clear_rrq(struct lpfc_vport *vport,
 			get_job_ulpcontext(phba, iocb));
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		"Clear RRQ:  did:x%x flg:x%x exchg:x%.08x",
+		"Clear RRQ:  did:x%x flg:x%lx exchg:x%.08x",
 		ndlp->nlp_DID, ndlp->nlp_flag, rrq->rrq_exchg);
 	if (vport->fc_myDID == be32_to_cpu(bf_get(rrq_did, rrq)))
 		xri = bf_get(rrq_oxid, rrq);
@@ -6412,19 +6414,19 @@ lpfc_els_rsp_echo_acc(struct lpfc_vport *vport, uint8_t *data,
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "2876 Xmit ECHO ACC response tag x%x xri x%x\n",
 			 elsiocb->iotag, ulp_context);
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint32_t);
 	memcpy(pcmd, data, cmdsize - sizeof(uint32_t));
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
-		      "Issue ACC ECHO:  did:x%x flg:x%x refcnt %d",
+		      "Issue ACC ECHO:  did:x%x flg:x%lx refcnt %d",
 		      ndlp->nlp_DID, ndlp->nlp_flag, kref_read(&ndlp->kref));
 
 	phba->fc_stat.elsXmitACC++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 =  lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp =  lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -6461,7 +6463,6 @@ lpfc_els_rsp_echo_acc(struct lpfc_vport *vport, uint8_t *data,
 int
 lpfc_els_disc_adisc(struct lpfc_vport *vport)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_nodelist *ndlp, *next_ndlp;
 	int sentadisc = 0;
 
@@ -6469,14 +6470,12 @@ lpfc_els_disc_adisc(struct lpfc_vport *vport)
 	list_for_each_entry_safe(ndlp, next_ndlp, &vport->fc_nodes, nlp_listp) {
 
 		if (ndlp->nlp_state != NLP_STE_NPR_NODE ||
-		    !(ndlp->nlp_flag & NLP_NPR_ADISC))
+		    !test_bit(NLP_NPR_ADISC, &ndlp->nlp_flag))
 			continue;
 
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag &= ~NLP_NPR_ADISC;
-		spin_unlock_irq(&ndlp->lock);
+		clear_bit(NLP_NPR_ADISC, &ndlp->nlp_flag);
 
-		if (!(ndlp->nlp_flag & NLP_NPR_2B_DISC)) {
+		if (!test_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag)) {
 			/* This node was marked for ADISC but was not picked
 			 * for discovery. This is possible if the node was
 			 * missing in gidft response.
@@ -6496,18 +6495,13 @@ lpfc_els_disc_adisc(struct lpfc_vport *vport)
 		vport->num_disc_nodes++;
 		if (vport->num_disc_nodes >=
 				vport->cfg_discovery_threads) {
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag |= FC_NLP_MORE;
-			spin_unlock_irq(shost->host_lock);
+			set_bit(FC_NLP_MORE, &vport->fc_flag);
 			break;
 		}
 
 	}
-	if (sentadisc == 0) {
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag &= ~FC_NLP_MORE;
-		spin_unlock_irq(shost->host_lock);
-	}
+	if (sentadisc == 0)
+		clear_bit(FC_NLP_MORE, &vport->fc_flag);
 	return sentadisc;
 }
 
@@ -6533,16 +6527,15 @@ lpfc_els_disc_adisc(struct lpfc_vport *vport)
 int
 lpfc_els_disc_plogi(struct lpfc_vport *vport)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_nodelist *ndlp, *next_ndlp;
 	int sentplogi = 0;
 
 	/* go thru NPR nodes and issue any remaining ELS PLOGIs */
 	list_for_each_entry_safe(ndlp, next_ndlp, &vport->fc_nodes, nlp_listp) {
 		if (ndlp->nlp_state == NLP_STE_NPR_NODE &&
-				(ndlp->nlp_flag & NLP_NPR_2B_DISC) != 0 &&
-				(ndlp->nlp_flag & NLP_DELAY_TMO) == 0 &&
-				(ndlp->nlp_flag & NLP_NPR_ADISC) == 0) {
+		    test_bit(NLP_NPR_2B_DISC, &ndlp->nlp_flag) &&
+		    !test_bit(NLP_DELAY_TMO, &ndlp->nlp_flag) &&
+		    !test_bit(NLP_NPR_ADISC, &ndlp->nlp_flag)) {
 			ndlp->nlp_prev_state = ndlp->nlp_state;
 			lpfc_nlp_set_state(vport, ndlp, NLP_STE_PLOGI_ISSUE);
 			lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
@@ -6550,26 +6543,20 @@ lpfc_els_disc_plogi(struct lpfc_vport *vport)
 			vport->num_disc_nodes++;
 			if (vport->num_disc_nodes >=
 					vport->cfg_discovery_threads) {
-				spin_lock_irq(shost->host_lock);
-				vport->fc_flag |= FC_NLP_MORE;
-				spin_unlock_irq(shost->host_lock);
+				set_bit(FC_NLP_MORE, &vport->fc_flag);
 				break;
 			}
 		}
 	}
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
-			 "6452 Discover PLOGI %d flag x%x\n",
+			 "6452 Discover PLOGI %d flag x%lx\n",
 			 sentplogi, vport->fc_flag);
 
-	if (sentplogi) {
+	if (sentplogi)
 		lpfc_set_disctmo(vport);
-	}
-	else {
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag &= ~FC_NLP_MORE;
-		spin_unlock_irq(shost->host_lock);
-	}
+	else
+		clear_bit(FC_NLP_MORE, &vport->fc_flag);
 	return sentplogi;
 }
 
@@ -6980,7 +6967,7 @@ lpfc_rdp_res_attach_port_names(struct fc_rdp_port_name_desc *desc,
 {
 
 	desc->tag = cpu_to_be32(RDP_PORT_NAMES_DESC_TAG);
-	if (vport->fc_flag & FC_FABRIC) {
+	if (test_bit(FC_FABRIC, &vport->fc_flag)) {
 		memcpy(desc->port_names.wwnn, &vport->fabric_nodename,
 		       sizeof(desc->port_names.wwnn));
 
@@ -7044,13 +7031,12 @@ lpfc_els_rdp_cmpl(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context,
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			"2171 Xmit RDP response tag x%x xri x%x, "
-			"did x%x, nlp_flag x%x, nlp_state x%x, rpi x%x",
+			"did x%x, nlp_flag x%lx, nlp_state x%x, rpi x%x",
 			elsiocb->iotag, ulp_context,
 			ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			ndlp->nlp_rpi);
-	rdp_res = (struct fc_rdp_res_frame *)
-		(((struct lpfc_dmabuf *) elsiocb->context2)->virt);
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	rdp_res = (struct fc_rdp_res_frame *)elsiocb->cmd_dmabuf->virt;
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	memset(pcmd, 0, sizeof(struct fc_rdp_res_frame));
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 
@@ -7101,15 +7087,14 @@ lpfc_els_rdp_cmpl(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context,
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 
 	/* Now that we know the true size of the payload, update the BPL */
-	bpl = (struct ulp_bde64 *)
-		(((struct lpfc_dmabuf *)(elsiocb->context3))->virt);
+	bpl = (struct ulp_bde64 *)elsiocb->bpl_dmabuf->virt;
 	bpl->tus.f.bdeSize = len;
 	bpl->tus.f.bdeFlags = 0;
 	bpl->tus.w = le32_to_cpu(bpl->tus.w);
 
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto free_rdp_context;
 	}
@@ -7143,7 +7128,7 @@ error:
 		icmd->unsli3.rcvsli3.ox_id = rdp_context->ox_id;
 	}
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *) (pcmd)) = ELS_CMD_LS_RJT;
 	stat = (struct ls_rjt *)(pcmd + sizeof(uint32_t));
@@ -7151,8 +7136,8 @@ error:
 
 	phba->fc_stat.elsXmitLSRJT++;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto free_rdp_context;
 	}
@@ -7175,7 +7160,6 @@ static int
 lpfc_get_rdp_info(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context)
 {
 	LPFC_MBOXQ_t *mbox = NULL;
-	struct lpfc_dmabuf *mp;
 	int rc;
 
 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
@@ -7186,21 +7170,150 @@ lpfc_get_rdp_info(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context)
 	}
 
 	if (lpfc_sli4_dump_page_a0(phba, mbox))
-		goto prep_mbox_fail;
+		goto rdp_fail;
 	mbox->vport = rdp_context->ndlp->vport;
 	mbox->mbox_cmpl = lpfc_mbx_cmpl_rdp_page_a0;
-	mbox->ctx_ndlp = (struct lpfc_rdp_context *)rdp_context;
+	mbox->ctx_u.rdp = rdp_context;
 	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT);
 	if (rc == MBX_NOT_FINISHED) {
-		mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
-		lpfc_mbuf_free(phba, mp->virt, mp->phys);
-		goto issue_mbox_fail;
+		lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
+		return 1;
 	}
 
 	return 0;
 
-prep_mbox_fail:
-issue_mbox_fail:
+rdp_fail:
+	mempool_free(mbox, phba->mbox_mem_pool);
+	return 1;
+}
+
+int lpfc_get_sfp_info_wait(struct lpfc_hba *phba,
+			   struct lpfc_rdp_context *rdp_context)
+{
+	LPFC_MBOXQ_t *mbox = NULL;
+	int rc;
+	struct lpfc_dmabuf *mp;
+	struct lpfc_dmabuf *mpsave;
+	void *virt;
+	MAILBOX_t *mb;
+
+	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
+	if (!mbox) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_MBOX | LOG_ELS,
+				"7205 failed to allocate mailbox memory");
+		return 1;
+	}
+
+	if (lpfc_sli4_dump_page_a0(phba, mbox))
+		goto sfp_fail;
+	mp = mbox->ctx_buf;
+	mpsave = mp;
+	virt = mp->virt;
+	if (phba->sli_rev < LPFC_SLI_REV4) {
+		mb = &mbox->u.mb;
+		mb->un.varDmp.cv = 1;
+		mb->un.varDmp.co = 1;
+		mb->un.varWords[2] = 0;
+		mb->un.varWords[3] = DMP_SFF_PAGE_A0_SIZE / 4;
+		mb->un.varWords[4] = 0;
+		mb->un.varWords[5] = 0;
+		mb->un.varWords[6] = 0;
+		mb->un.varWords[7] = 0;
+		mb->un.varWords[8] = 0;
+		mb->un.varWords[9] = 0;
+		mb->un.varWords[10] = 0;
+		mbox->in_ext_byte_len = DMP_SFF_PAGE_A0_SIZE;
+		mbox->out_ext_byte_len = DMP_SFF_PAGE_A0_SIZE;
+		mbox->mbox_offset_word = 5;
+		mbox->ext_buf = virt;
+	} else {
+		bf_set(lpfc_mbx_memory_dump_type3_length,
+		       &mbox->u.mqe.un.mem_dump_type3, DMP_SFF_PAGE_A0_SIZE);
+		mbox->u.mqe.un.mem_dump_type3.addr_lo = putPaddrLow(mp->phys);
+		mbox->u.mqe.un.mem_dump_type3.addr_hi = putPaddrHigh(mp->phys);
+	}
+	mbox->vport = phba->pport;
+	rc = lpfc_sli_issue_mbox_wait(phba, mbox, LPFC_MBOX_SLI4_CONFIG_TMO);
+	if (rc == MBX_NOT_FINISHED) {
+		rc = 1;
+		goto error;
+	}
+	if (rc == MBX_TIMEOUT)
+		goto error;
+	if (phba->sli_rev == LPFC_SLI_REV4)
+		mp = mbox->ctx_buf;
+	else
+		mp = mpsave;
+
+	if (bf_get(lpfc_mqe_status, &mbox->u.mqe)) {
+		rc = 1;
+		goto error;
+	}
+
+	lpfc_sli_bemem_bcopy(mp->virt, &rdp_context->page_a0,
+			     DMP_SFF_PAGE_A0_SIZE);
+
+	memset(mbox, 0, sizeof(*mbox));
+	memset(mp->virt, 0, DMP_SFF_PAGE_A2_SIZE);
+	INIT_LIST_HEAD(&mp->list);
+
+	/* save address for completion */
+	mbox->ctx_buf = mp;
+	mbox->vport = phba->pport;
+
+	bf_set(lpfc_mqe_command, &mbox->u.mqe, MBX_DUMP_MEMORY);
+	bf_set(lpfc_mbx_memory_dump_type3_type,
+	       &mbox->u.mqe.un.mem_dump_type3, DMP_LMSD);
+	bf_set(lpfc_mbx_memory_dump_type3_link,
+	       &mbox->u.mqe.un.mem_dump_type3, phba->sli4_hba.physical_port);
+	bf_set(lpfc_mbx_memory_dump_type3_page_no,
+	       &mbox->u.mqe.un.mem_dump_type3, DMP_PAGE_A2);
+	if (phba->sli_rev < LPFC_SLI_REV4) {
+		mb = &mbox->u.mb;
+		mb->un.varDmp.cv = 1;
+		mb->un.varDmp.co = 1;
+		mb->un.varWords[2] = 0;
+		mb->un.varWords[3] = DMP_SFF_PAGE_A2_SIZE / 4;
+		mb->un.varWords[4] = 0;
+		mb->un.varWords[5] = 0;
+		mb->un.varWords[6] = 0;
+		mb->un.varWords[7] = 0;
+		mb->un.varWords[8] = 0;
+		mb->un.varWords[9] = 0;
+		mb->un.varWords[10] = 0;
+		mbox->in_ext_byte_len = DMP_SFF_PAGE_A2_SIZE;
+		mbox->out_ext_byte_len = DMP_SFF_PAGE_A2_SIZE;
+		mbox->mbox_offset_word = 5;
+		mbox->ext_buf = virt;
+	} else {
+		bf_set(lpfc_mbx_memory_dump_type3_length,
+		       &mbox->u.mqe.un.mem_dump_type3, DMP_SFF_PAGE_A2_SIZE);
+		mbox->u.mqe.un.mem_dump_type3.addr_lo = putPaddrLow(mp->phys);
+		mbox->u.mqe.un.mem_dump_type3.addr_hi = putPaddrHigh(mp->phys);
+	}
+
+	rc = lpfc_sli_issue_mbox_wait(phba, mbox, LPFC_MBOX_SLI4_CONFIG_TMO);
+
+	if (rc == MBX_TIMEOUT)
+		goto error;
+	if (bf_get(lpfc_mqe_status, &mbox->u.mqe)) {
+		rc = 1;
+		goto error;
+	}
+	rc = 0;
+
+	lpfc_sli_bemem_bcopy(mp->virt, &rdp_context->page_a2,
+			     DMP_SFF_PAGE_A2_SIZE);
+
+error:
+	if (mbox->mbox_flag & LPFC_MBX_WAKE) {
+		mbox->ctx_buf = mpsave;
+		lpfc_mbox_rsrc_cleanup(phba, mbox, MBOX_THD_UNLOCKED);
+	}
+
+	return rc;
+
+sfp_fail:
 	mempool_free(mbox, phba->mbox_mem_pool);
 	return 1;
 }
@@ -7242,13 +7355,14 @@ lpfc_els_rcv_rdp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		goto error;
 	}
 
-	if (phba->sli_rev < LPFC_SLI_REV4 || (phba->hba_flag & HBA_FCOE_MODE)) {
+	if (phba->sli_rev < LPFC_SLI_REV4 ||
+	    test_bit(HBA_FCOE_MODE, &phba->hba_flag)) {
 		rjt_err = LSRJT_UNABLE_TPC;
 		rjt_expl = LSEXP_REQ_UNSUPPORTED;
 		goto error;
 	}
 
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	rdp_req = (struct fc_rdp_req_frame *) pcmd->virt;
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
@@ -7325,9 +7439,9 @@ lpfc_els_lcb_rsp(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	int rc;
 
 	mb = &pmb->u.mb;
-	lcb_context = (struct lpfc_lcb_context *)pmb->ctx_ndlp;
+	lcb_context = pmb->ctx_u.lcb;
 	ndlp = lcb_context->ndlp;
-	pmb->ctx_ndlp = NULL;
+	memset(&pmb->ctx_u, 0, sizeof(pmb->ctx_u));
 	pmb->ctx_buf = NULL;
 
 	shdr = (union lpfc_sli4_cfg_shdr *)
@@ -7360,8 +7474,7 @@ lpfc_els_lcb_rsp(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	if (!elsiocb)
 		goto free_lcb_context;
 
-	lcb_res = (struct fc_lcb_res_frame *)
-		(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	lcb_res = (struct fc_lcb_res_frame *)elsiocb->cmd_dmabuf->virt;
 
 	memset(lcb_res, 0, sizeof(struct fc_lcb_res_frame));
 
@@ -7376,7 +7489,7 @@ lpfc_els_lcb_rsp(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 		icmd->unsli3.rcvsli3.ox_id = lcb_context->ox_id;
 	}
 
-	pcmd = (uint8_t *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *)(pcmd)) = ELS_CMD_ACC;
 	lcb_res->lcb_sub_command = lcb_context->sub_command;
 	lcb_res->lcb_type = lcb_context->type;
@@ -7386,8 +7499,8 @@ lpfc_els_lcb_rsp(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	phba->fc_stat.elsXmitACC++;
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto out;
 	}
@@ -7421,7 +7534,7 @@ error:
 		icmd->unsli3.rcvsli3.ox_id = lcb_context->ox_id;
 	}
 
-	pcmd = (uint8_t *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	*((uint32_t *)(pcmd)) = ELS_CMD_LS_RJT;
 	stat = (struct ls_rjt *)(pcmd + sizeof(uint32_t));
@@ -7432,8 +7545,8 @@ error:
 
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	phba->fc_stat.elsXmitLSRJT++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto free_lcb_context;
 	}
@@ -7468,7 +7581,7 @@ lpfc_sli4_set_beacon(struct lpfc_vport *vport,
 	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_COMMON,
 			 LPFC_MBOX_OPCODE_SET_BEACON_CONFIG, len,
 			 LPFC_SLI4_MBX_EMBED);
-	mbox->ctx_ndlp = (void *)lcb_context;
+	mbox->ctx_u.lcb = lcb_context;
 	mbox->vport = phba->pport;
 	mbox->mbox_cmpl = lpfc_els_lcb_rsp;
 	bf_set(lpfc_mbx_set_beacon_port_num, &mbox->u.mqe.un.beacon_config,
@@ -7545,7 +7658,7 @@ lpfc_els_rcv_lcb(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	u8 state, rjt_err = 0;
 	struct ls_rjt stat;
 
-	pcmd = (struct lpfc_dmabuf *)cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	lp = (uint8_t *)pcmd->virt;
 	beacon = (struct fc_lcb_request_frame *)pcmd->virt;
 
@@ -7566,7 +7679,7 @@ lpfc_els_rcv_lcb(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	}
 
 	if (phba->sli_rev < LPFC_SLI_REV4  ||
-	    phba->hba_flag & HBA_FCOE_MODE ||
+	    test_bit(HBA_FCOE_MODE, &phba->hba_flag) ||
 	    (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) <
 	    LPFC_SLI_INTF_IF_TYPE_2)) {
 		rjt_err = LSRJT_CMD_UNSUPPORTED;
@@ -7642,9 +7755,10 @@ lpfc_els_flush_rscn(struct lpfc_vport *vport)
 		lpfc_in_buf_free(phba, vport->fc_rscn_id_list[i]);
 		vport->fc_rscn_id_list[i] = NULL;
 	}
+	clear_bit(FC_RSCN_MODE, &vport->fc_flag);
+	clear_bit(FC_RSCN_DISCOVERY, &vport->fc_flag);
 	spin_lock_irq(shost->host_lock);
 	vport->fc_rscn_id_cnt = 0;
-	vport->fc_flag &= ~(FC_RSCN_MODE | FC_RSCN_DISCOVERY);
 	spin_unlock_irq(shost->host_lock);
 	lpfc_can_disctmo(vport);
 	/* Indicate we are done walking this fc_rscn_id_list */
@@ -7679,7 +7793,7 @@ lpfc_rscn_payload_check(struct lpfc_vport *vport, uint32_t did)
 		return 0;
 
 	/* If we are doing a FULL RSCN rediscovery, match everything */
-	if (vport->fc_flag & FC_RSCN_DISCOVERY)
+	if (test_bit(FC_RSCN_DISCOVERY, &vport->fc_flag))
 		return did;
 
 	spin_lock_irq(shost->host_lock);
@@ -7742,10 +7856,10 @@ return_did_out:
 static int
 lpfc_rscn_recovery_check(struct lpfc_vport *vport)
 {
-	struct lpfc_nodelist *ndlp = NULL;
+	struct lpfc_nodelist *ndlp = NULL, *n;
 
 	/* Move all affected nodes by pending RSCNs to NPR state. */
-	list_for_each_entry(ndlp, &vport->fc_nodes, nlp_listp) {
+	list_for_each_entry_safe(ndlp, n, &vport->fc_nodes, nlp_listp) {
 		if ((ndlp->nlp_state == NLP_STE_UNUSED_NODE) ||
 		    !lpfc_rscn_payload_check(vport, ndlp->nlp_DID))
 			continue;
@@ -7791,7 +7905,7 @@ lpfc_send_rscn_event(struct lpfc_vport *vport,
 	uint32_t payload_len;
 	struct lpfc_rscn_event_header *rscn_event_data;
 
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	payload_ptr = (uint32_t *) pcmd->virt;
 	payload_len = be32_to_cpu(*payload_ptr & ~ELS_CMD_MASK);
 
@@ -7851,14 +7965,14 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	int rscn_id = 0, hba_id = 0;
 	int i, tmo;
 
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	lp = (uint32_t *) pcmd->virt;
 
 	payload_len = be32_to_cpu(*lp++ & ~ELS_CMD_MASK);
 	payload_len -= sizeof(uint32_t);	/* take off word 0 */
 	/* RSCN received */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
-			 "0214 RSCN received Data: x%x x%x x%x x%x\n",
+			 "0214 RSCN received Data: x%lx x%x x%x x%x\n",
 			 vport->fc_flag, payload_len, *lp,
 			 vport->fc_rscn_id_cnt);
 
@@ -7870,10 +7984,10 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			FCH_EVT_RSCN, lp[i]);
 
 	/* Check if RSCN is coming from a direct-connected remote NPort */
-	if (vport->fc_flag & FC_PT2PT) {
+	if (test_bit(FC_PT2PT, &vport->fc_flag)) {
 		/* If so, just ACC it, no other action needed for now */
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
-				 "2024 pt2pt RSCN %08x Data: x%x x%x\n",
+				 "2024 pt2pt RSCN %08x Data: x%lx x%x\n",
 				 *lp, vport->fc_flag, payload_len);
 		lpfc_els_rsp_acc(vport, ELS_CMD_ACC, cmdiocb, ndlp, NULL);
 
@@ -7891,7 +8005,7 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	 */
 	if (vport->port_state <= LPFC_NS_QRY) {
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RSCN ignore: did:x%x/ste:x%x flg:x%x",
+			"RCV RSCN ignore: did:x%x/ste:x%x flg:x%lx",
 			ndlp->nlp_DID, vport->port_state, ndlp->nlp_flag);
 
 		lpfc_els_rsp_acc(vport, ELS_CMD_ACC, cmdiocb, ndlp, NULL);
@@ -7917,18 +8031,18 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			/* ALL NPortIDs in RSCN are on HBA */
 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 					 "0219 Ignore RSCN "
-					 "Data: x%x x%x x%x x%x\n",
+					 "Data: x%lx x%x x%x x%x\n",
 					 vport->fc_flag, payload_len,
 					 *lp, vport->fc_rscn_id_cnt);
 			lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-				"RCV RSCN vport:  did:x%x/ste:x%x flg:x%x",
+				"RCV RSCN vport:  did:x%x/ste:x%x flg:x%lx",
 				ndlp->nlp_DID, vport->port_state,
 				ndlp->nlp_flag);
 
 			lpfc_els_rsp_acc(vport, ELS_CMD_ACC, cmdiocb,
 				ndlp, NULL);
 			/* Restart disctmo if its already running */
-			if (vport->fc_flag & FC_DISC_TMO) {
+			if (test_bit(FC_DISC_TMO, &vport->fc_flag)) {
 				tmo = ((phba->fc_ratov * 3) + 3);
 				mod_timer(&vport->fc_disctmo,
 					  jiffies +
@@ -7941,8 +8055,8 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	spin_lock_irq(shost->host_lock);
 	if (vport->fc_rscn_flush) {
 		/* Another thread is walking fc_rscn_id_list on this vport */
-		vport->fc_flag |= FC_RSCN_DISCOVERY;
 		spin_unlock_irq(shost->host_lock);
+		set_bit(FC_RSCN_DISCOVERY, &vport->fc_flag);
 		/* Send back ACC */
 		lpfc_els_rsp_acc(vport, ELS_CMD_ACC, cmdiocb, ndlp, NULL);
 		return 0;
@@ -7953,26 +8067,25 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	/* Get the array count after successfully have the token */
 	rscn_cnt = vport->fc_rscn_id_cnt;
 	/* If we are already processing an RSCN, save the received
-	 * RSCN payload buffer, cmdiocb->context2 to process later.
+	 * RSCN payload buffer, cmdiocb->cmd_dmabuf to process later.
 	 */
-	if (vport->fc_flag & (FC_RSCN_MODE | FC_NDISC_ACTIVE)) {
+	if (test_bit(FC_RSCN_MODE, &vport->fc_flag) ||
+	    test_bit(FC_NDISC_ACTIVE, &vport->fc_flag)) {
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RSCN defer:  did:x%x/ste:x%x flg:x%x",
+			"RCV RSCN defer:  did:x%x/ste:x%x flg:x%lx",
 			ndlp->nlp_DID, vport->port_state, ndlp->nlp_flag);
 
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_RSCN_DEFERRED;
+		set_bit(FC_RSCN_DEFERRED, &vport->fc_flag);
 
 		/* Restart disctmo if its already running */
-		if (vport->fc_flag & FC_DISC_TMO) {
+		if (test_bit(FC_DISC_TMO, &vport->fc_flag)) {
 			tmo = ((phba->fc_ratov * 3) + 3);
 			mod_timer(&vport->fc_disctmo,
 				  jiffies + msecs_to_jiffies(1000 * tmo));
 		}
 		if ((rscn_cnt < FC_MAX_HOLD_RSCN) &&
-		    !(vport->fc_flag & FC_RSCN_DISCOVERY)) {
-			vport->fc_flag |= FC_RSCN_MODE;
-			spin_unlock_irq(shost->host_lock);
+		    !test_bit(FC_RSCN_DISCOVERY, &vport->fc_flag)) {
+			set_bit(FC_RSCN_MODE, &vport->fc_flag);
 			if (rscn_cnt) {
 				cmd = vport->fc_rscn_id_list[rscn_cnt-1]->virt;
 				length = be32_to_cpu(*cmd & ~ELS_CMD_MASK);
@@ -7986,24 +8099,23 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			} else {
 				vport->fc_rscn_id_list[rscn_cnt] = pcmd;
 				vport->fc_rscn_id_cnt++;
-				/* If we zero, cmdiocb->context2, the calling
+				/* If we zero, cmdiocb->cmd_dmabuf, the calling
 				 * routine will not try to free it.
 				 */
-				cmdiocb->context2 = NULL;
+				cmdiocb->cmd_dmabuf = NULL;
 			}
 			/* Deferred RSCN */
 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 					 "0235 Deferred RSCN "
-					 "Data: x%x x%x x%x\n",
+					 "Data: x%x x%lx x%x\n",
 					 vport->fc_rscn_id_cnt, vport->fc_flag,
 					 vport->port_state);
 		} else {
-			vport->fc_flag |= FC_RSCN_DISCOVERY;
-			spin_unlock_irq(shost->host_lock);
+			set_bit(FC_RSCN_DISCOVERY, &vport->fc_flag);
 			/* ReDiscovery RSCN */
 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 					 "0234 ReDiscovery RSCN "
-					 "Data: x%x x%x x%x\n",
+					 "Data: x%x x%lx x%x\n",
 					 vport->fc_rscn_id_cnt, vport->fc_flag,
 					 vport->port_state);
 		}
@@ -8016,20 +8128,18 @@ lpfc_els_rcv_rscn(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		return 0;
 	}
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-		"RCV RSCN:        did:x%x/ste:x%x flg:x%x",
+		"RCV RSCN:        did:x%x/ste:x%x flg:x%lx",
 		ndlp->nlp_DID, vport->port_state, ndlp->nlp_flag);
 
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag |= FC_RSCN_MODE;
-	spin_unlock_irq(shost->host_lock);
+	set_bit(FC_RSCN_MODE, &vport->fc_flag);
 	vport->fc_rscn_id_list[vport->fc_rscn_id_cnt++] = pcmd;
 	/* Indicate we are done walking fc_rscn_id_list on this vport */
 	vport->fc_rscn_flush = 0;
 	/*
-	 * If we zero, cmdiocb->context2, the calling routine will
+	 * If we zero, cmdiocb->cmd_dmabuf, the calling routine will
 	 * not try to free it.
 	 */
-	cmdiocb->context2 = NULL;
+	cmdiocb->cmd_dmabuf = NULL;
 	lpfc_set_disctmo(vport);
 	/* Send back ACC */
 	lpfc_els_rsp_acc(vport, ELS_CMD_ACC, cmdiocb, ndlp, NULL);
@@ -8061,7 +8171,7 @@ lpfc_els_handle_rscn(struct lpfc_vport *vport)
 	struct lpfc_hba  *phba = vport->phba;
 
 	/* Ignore RSCN if the port is being torn down. */
-	if (vport->load_flag & FC_UNLOADING) {
+	if (test_bit(FC_UNLOADING, &vport->load_flag)) {
 		lpfc_els_flush_rscn(vport);
 		return 0;
 	}
@@ -8071,7 +8181,7 @@ lpfc_els_handle_rscn(struct lpfc_vport *vport)
 
 	/* RSCN processed */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
-			 "0215 RSCN processed Data: x%x x%x x%x x%x x%x x%x\n",
+			 "0215 RSCN processed Data: x%lx x%x x%x x%x x%x x%x\n",
 			 vport->fc_flag, 0, vport->fc_rscn_id_cnt,
 			 vport->port_state, vport->num_disc_nodes,
 			 vport->gidft_inp);
@@ -8153,15 +8263,18 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 {
 	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba  *phba = vport->phba;
-	struct lpfc_dmabuf *pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	struct lpfc_dmabuf *pcmd = cmdiocb->cmd_dmabuf;
 	uint32_t *lp = (uint32_t *) pcmd->virt;
 	union lpfc_wqe128 *wqe = &cmdiocb->wqe;
 	struct serv_parm *sp;
 	LPFC_MBOXQ_t *mbox;
 	uint32_t cmd, did;
 	int rc;
-	uint32_t fc_flag = 0;
+	unsigned long fc_flag = 0;
 	uint32_t port_state = 0;
+
+	/* Clear external loopback plug detected flag */
+	phba->link_flag &= ~LS_EXTERNAL_LOOPBACK;
 
 	cmd = *lp++;
 	sp = (struct serv_parm *) lp;
@@ -8214,6 +8327,12 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			return 1;
 		}
 
+		/* External loopback plug insertion detected */
+		phba->link_flag |= LS_EXTERNAL_LOOPBACK;
+
+		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_LIBDFC,
+				 "1119 External Loopback plug detected\n");
+
 		/* abort the flogi coming back to ourselves
 		 * due to external loopback on the port.
 		 */
@@ -8221,9 +8340,7 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		return 0;
 
 	} else if (rc > 0) {	/* greater than */
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_PT2PT_PLOGI;
-		spin_unlock_irq(shost->host_lock);
+		set_bit(FC_PT2PT_PLOGI, &vport->fc_flag);
 
 		/* If we have the high WWPN we can assign our own
 		 * myDID; otherwise, we have to WAIT for a PLOGI
@@ -8242,17 +8359,17 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	spin_lock_irq(shost->host_lock);
 	fc_flag = vport->fc_flag;
 	port_state = vport->port_state;
-	vport->fc_flag |= FC_PT2PT;
-	vport->fc_flag &= ~(FC_FABRIC | FC_PUBLIC_LOOP);
-
 	/* Acking an unsol FLOGI.  Count 1 for link bounce
 	 * work-around.
 	 */
 	vport->rcv_flogi_cnt++;
 	spin_unlock_irq(shost->host_lock);
+	set_bit(FC_PT2PT, &vport->fc_flag);
+	clear_bit(FC_FABRIC, &vport->fc_flag);
+	clear_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "3311 Rcv Flogi PS x%x new PS x%x "
-			 "fc_flag x%x new fc_flag x%x\n",
+			 "fc_flag x%lx new fc_flag x%lx\n",
 			 port_state, vport->port_state,
 			 fc_flag, vport->fc_flag);
 
@@ -8267,22 +8384,28 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	memcpy(&phba->fc_fabparam, sp, sizeof(struct serv_parm));
 
 	/* Defer ACC response until AFTER we issue a FLOGI */
-	if (!(phba->hba_flag & HBA_FLOGI_ISSUED)) {
-		phba->defer_flogi_acc_rx_id = bf_get(wqe_ctxt_tag,
+	if (!test_bit(HBA_FLOGI_ISSUED, &phba->hba_flag)) {
+		phba->defer_flogi_acc.rx_id = bf_get(wqe_ctxt_tag,
 						     &wqe->xmit_els_rsp.wqe_com);
-		phba->defer_flogi_acc_ox_id = bf_get(wqe_rcvoxid,
+		phba->defer_flogi_acc.ox_id = bf_get(wqe_rcvoxid,
 						     &wqe->xmit_els_rsp.wqe_com);
 
 		vport->fc_myDID = did;
 
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 				 "3344 Deferring FLOGI ACC: rx_id: x%x,"
-				 " ox_id: x%x, hba_flag x%x\n",
-				 phba->defer_flogi_acc_rx_id,
-				 phba->defer_flogi_acc_ox_id, phba->hba_flag);
+				 " ox_id: x%x, hba_flag x%lx\n",
+				 phba->defer_flogi_acc.rx_id,
+				 phba->defer_flogi_acc.ox_id, phba->hba_flag);
 
-		phba->defer_flogi_acc_flag = true;
+		phba->defer_flogi_acc.flag = true;
 
+		/* This nlp_get is paired with nlp_puts that reset the
+		 * defer_flogi_acc.flag back to false.  We need to retain
+		 * a kref on the ndlp until the deferred FLOGI ACC is
+		 * processed or cancelled.
+		 */
+		phba->defer_flogi_acc.ndlp = lpfc_nlp_get(ndlp);
 		return 0;
 	}
 
@@ -8320,7 +8443,7 @@ lpfc_els_rcv_rnid(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	RNID *rn;
 	struct ls_rjt stat;
 
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	lp = (uint32_t *) pcmd->virt;
 
 	lp++;
@@ -8361,7 +8484,7 @@ lpfc_els_rcv_echo(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 {
 	uint8_t *pcmd;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) cmdiocb->context2)->virt);
+	pcmd = (uint8_t *)cmdiocb->cmd_dmabuf->virt;
 
 	/* skip over first word of echo command to find echo data */
 	pcmd += sizeof(uint32_t);
@@ -8437,7 +8560,7 @@ lpfc_els_rcv_rrq(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
  * response to the RLS.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the RLS Accept Response
  * ELS IOCB command.
  *
@@ -8460,10 +8583,10 @@ lpfc_els_rsp_rls_acc(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 
 	mb = &pmb->u.mb;
 
-	ndlp = (struct lpfc_nodelist *)pmb->ctx_ndlp;
-	rxid = (uint16_t)((unsigned long)(pmb->ctx_buf) & 0xffff);
-	oxid = (uint16_t)(((unsigned long)(pmb->ctx_buf) >> 16) & 0xffff);
-	pmb->ctx_buf = NULL;
+	ndlp = pmb->ctx_ndlp;
+	rxid = (uint16_t)(pmb->ctx_u.ox_rx_id & 0xffff);
+	oxid = (uint16_t)((pmb->ctx_u.ox_rx_id >> 16) & 0xffff);
+	memset(&pmb->ctx_u, 0, sizeof(pmb->ctx_u));
 	pmb->ctx_ndlp = NULL;
 
 	if (mb->mbxStatus) {
@@ -8496,7 +8619,7 @@ lpfc_els_rsp_rls_acc(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 		icmd->unsli3.rcvsli3.ox_id = oxid;
 	}
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint32_t); /* Skip past command */
 	rls_rsp = (struct RLS_RSP *)pcmd;
@@ -8511,14 +8634,14 @@ lpfc_els_rsp_rls_acc(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	/* Xmit ELS RLS ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(ndlp->vport, KERN_INFO, LOG_ELS,
 			 "2874 Xmit ELS RLS ACC response tag x%x xri x%x, "
-			 "did x%x, nlp_flag x%x, nlp_state x%x, rpi x%x\n",
+			 "did x%x, nlp_flag x%lx, nlp_state x%x, rpi x%x\n",
 			 elsiocb->iotag, ulp_context,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi);
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return;
 	}
@@ -8567,8 +8690,7 @@ lpfc_els_rcv_rls(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_ATOMIC);
 	if (mbox) {
 		lpfc_read_lnk_stat(phba, mbox);
-		mbox->ctx_buf = (void *)((unsigned long)
-					 (ox_id << 16 | ctx));
+		mbox->ctx_u.ox_rx_id = ox_id << 16 | ctx;
 		mbox->ctx_ndlp = lpfc_nlp_get(ndlp);
 		if (!mbox->ctx_ndlp)
 			goto node_err;
@@ -8609,7 +8731,7 @@ reject_out:
  * Value (RTV) unsolicited IOCB event.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the RTV Accept Response
  * ELS IOCB command.
  *
@@ -8644,7 +8766,7 @@ lpfc_els_rcv_rtv(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint32_t); /* Skip past command */
 
@@ -8674,7 +8796,7 @@ lpfc_els_rcv_rtv(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	/* Xmit ELS RLS ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(ndlp->vport, KERN_INFO, LOG_ELS,
 			 "2875 Xmit ELS RTV ACC response tag x%x xri x%x, "
-			 "did x%x, nlp_flag x%x, nlp_state x%x, rpi x%x, "
+			 "did x%x, nlp_flag x%lx, nlp_state x%x, rpi x%x, "
 			 "Data: x%x x%x x%x\n",
 			 elsiocb->iotag, ulp_context,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
@@ -8682,8 +8804,8 @@ lpfc_els_rcv_rtv(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			rtv_rsp->ratov, rtv_rsp->edtov, rtv_rsp->qtov);
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 0;
 	}
@@ -8712,7 +8834,7 @@ reject_out:
  * @rrq: Pointer to the rrq struct.
  *
  * Build a ELS RRQ command and send it to the target. If the issue_iocb is
- * Successful the the completion handler will clear the RRQ.
+ * successful, the completion handler will clear the RRQ.
  *
  * Return codes
  *   0 - Successfully sent rrq els iocb.
@@ -8739,7 +8861,7 @@ lpfc_issue_els_rrq(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 
 	/* For RRQ request, remainder of payload is Exchange IDs */
 	*((uint32_t *) (pcmd)) = ELS_CMD_RRQ;
@@ -8759,17 +8881,19 @@ lpfc_issue_els_rrq(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	elsiocb->context_un.rrq = rrq;
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rrq;
 
-	lpfc_nlp_get(ndlp);
-	elsiocb->context1 = ndlp;
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp)
+		goto io_err;
 
 	ret = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, elsiocb, 0);
-	if (ret == IOCB_ERROR)
+	if (ret == IOCB_ERROR) {
+		lpfc_nlp_put(ndlp);
 		goto io_err;
+	}
 	return 0;
 
  io_err:
 	lpfc_els_free_iocb(phba, elsiocb);
-	lpfc_nlp_put(ndlp);
 	return 1;
 }
 
@@ -8811,7 +8935,7 @@ lpfc_send_rrq(struct lpfc_hba *phba, struct lpfc_node_rrq *rrq)
  * It is to be called by the lpfc_els_rcv_rpl() routine to accept the RPL.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the RPL Accept Response
  * ELS command.
  *
@@ -8852,7 +8976,7 @@ lpfc_els_rsp_rpl_acc(struct lpfc_vport *vport, uint16_t cmdsize,
 		icmd->unsli3.rcvsli3.ox_id = get_job_rcvoxid(phba, oldiocb);
 	}
 
-	pcmd = (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_ACC;
 	pcmd += sizeof(uint16_t);
 	*((uint16_t *)(pcmd)) = be16_to_cpu(cmdsize);
@@ -8869,15 +8993,15 @@ lpfc_els_rsp_rpl_acc(struct lpfc_vport *vport, uint16_t cmdsize,
 	/* Xmit ELS RPL ACC response tag <ulpIoTag> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0120 Xmit ELS RPL ACC response tag x%x "
-			 "xri x%x, did x%x, nlp_flag x%x, nlp_state x%x, "
+			 "xri x%x, did x%x, nlp_flag x%lx, nlp_state x%x, "
 			 "rpi x%x\n",
 			 elsiocb->iotag, ulp_context,
 			 ndlp->nlp_DID, ndlp->nlp_flag, ndlp->nlp_state,
 			 ndlp->nlp_rpi);
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_rsp;
 	phba->fc_stat.elsXmitACC++;
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		return 1;
 	}
@@ -8932,7 +9056,7 @@ lpfc_els_rcv_rpl(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		return 0;
 	}
 
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	lp = (uint32_t *) pcmd->virt;
 	rpl = (RPL *) (lp + 1);
 	maxsize = be32_to_cpu(rpl->maxsize);
@@ -8984,7 +9108,7 @@ lpfc_els_rcv_farp(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	uint32_t cnt, did;
 
 	did = get_job_els_rsp64_did(vport->phba, cmdiocb);
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
+	pcmd = cmdiocb->cmd_dmabuf;
 	lp = (uint32_t *) pcmd->virt;
 
 	lp++;
@@ -9049,15 +9173,10 @@ static int
 lpfc_els_rcv_farpr(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 		   struct lpfc_nodelist  *ndlp)
 {
-	struct lpfc_dmabuf *pcmd;
-	uint32_t *lp;
 	uint32_t did;
 
 	did = get_job_els_rsp64_did(vport->phba, cmdiocb);
-	pcmd = (struct lpfc_dmabuf *) cmdiocb->context2;
-	lp = (uint32_t *) pcmd->virt;
 
-	lp++;
 	/* FARP-RSP received from DID <did> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0600 FARP-RSP received from DID x%x\n", did);
@@ -9095,7 +9214,7 @@ lpfc_els_rcv_fan(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	FAN *fp;
 
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS, "0265 FAN received\n");
-	lp = (uint32_t *)((struct lpfc_dmabuf *)cmdiocb->context2)->virt;
+	lp = (uint32_t *)cmdiocb->cmd_dmabuf->virt;
 	fp = (FAN *) ++lp;
 	/* FAN received; Fan does not have a reply sequence */
 	if ((vport == phba->pport) &&
@@ -9142,15 +9261,16 @@ lpfc_els_rcv_edc(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	uint32_t *ptr, dtag;
 	const char *dtag_nm;
 	int desc_cnt = 0, bytes_remain;
-	bool rcv_cap_desc = false;
+	struct fc_diag_lnkflt_desc *plnkflt;
 
-	payload = ((struct lpfc_dmabuf *)cmdiocb->context2)->virt;
+	payload = cmdiocb->cmd_dmabuf->virt;
 
 	edc_req = (struct fc_els_edc *)payload;
 	bytes_remain = be32_to_cpu(edc_req->desc_len);
 
 	ptr = (uint32_t *)payload;
-	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_CGN_MGMT,
+	lpfc_printf_vlog(vport, KERN_INFO,
+			 LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 			 "3319 Rcv EDC payload len %d: x%x x%x x%x\n",
 			 bytes_remain, be32_to_cpu(*ptr),
 			 be32_to_cpu(*(ptr + 1)), be32_to_cpu(*(ptr + 2)));
@@ -9169,9 +9289,10 @@ lpfc_els_rcv_edc(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 	 * cycle through EDC diagnostic descriptors to find the
 	 * congestion signaling capability descriptor
 	 */
-	while (bytes_remain && !rcv_cap_desc) {
+	while (bytes_remain) {
 		if (bytes_remain < FC_TLV_DESC_HDR_SZ) {
-			lpfc_printf_log(phba, KERN_WARNING, LOG_CGN_MGMT,
+			lpfc_printf_log(phba, KERN_WARNING,
+					LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 					"6464 Truncated TLV hdr on "
 					"Diagnostic descriptor[%d]\n",
 					desc_cnt);
@@ -9184,16 +9305,27 @@ lpfc_els_rcv_edc(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 			if (bytes_remain < FC_TLV_DESC_SZ_FROM_LENGTH(tlv) ||
 			    FC_TLV_DESC_SZ_FROM_LENGTH(tlv) !=
 				sizeof(struct fc_diag_lnkflt_desc)) {
-				lpfc_printf_log(
-					phba, KERN_WARNING, LOG_CGN_MGMT,
+				lpfc_printf_log(phba, KERN_WARNING,
+					LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 					"6465 Truncated Link Fault Diagnostic "
 					"descriptor[%d]: %d vs 0x%zx 0x%zx\n",
 					desc_cnt, bytes_remain,
 					FC_TLV_DESC_SZ_FROM_LENGTH(tlv),
-					sizeof(struct fc_diag_cg_sig_desc));
+					sizeof(struct fc_diag_lnkflt_desc));
 				goto out;
 			}
-			/* No action for Link Fault descriptor for now */
+			plnkflt = (struct fc_diag_lnkflt_desc *)tlv;
+			lpfc_printf_log(phba, KERN_INFO,
+				LOG_ELS | LOG_LDS_EVENT,
+				"4626 Link Fault Desc Data: x%08x len x%x "
+				"da x%x dd x%x interval x%x\n",
+				be32_to_cpu(plnkflt->desc_tag),
+				be32_to_cpu(plnkflt->desc_len),
+				be32_to_cpu(
+					plnkflt->degrade_activate_threshold),
+				be32_to_cpu(
+					plnkflt->degrade_deactivate_threshold),
+				be32_to_cpu(plnkflt->fec_degrade_interval));
 			break;
 		case ELS_DTAG_CG_SIGNAL_CAP:
 			if (bytes_remain < FC_TLV_DESC_SZ_FROM_LENGTH(tlv) ||
@@ -9220,11 +9352,11 @@ lpfc_els_rcv_edc(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
 
 			lpfc_least_capable_settings(
 				phba, (struct fc_diag_cg_sig_desc *)tlv);
-			rcv_cap_desc = true;
 			break;
 		default:
 			dtag_nm = lpfc_get_tlv_dtag_nm(dtag);
-			lpfc_printf_log(phba, KERN_WARNING, LOG_CGN_MGMT,
+			lpfc_printf_log(phba, KERN_WARNING,
+					LOG_ELS | LOG_CGN_MGMT | LOG_LDS_EVENT,
 					"6467 unknown Diagnostic "
 					"Descriptor[%d]: tag x%x (%s)\n",
 					desc_cnt, dtag, dtag_nm);
@@ -9261,11 +9393,11 @@ lpfc_els_timeout(struct timer_list *t)
 
 	spin_lock_irqsave(&vport->work_port_lock, iflag);
 	tmo_posted = vport->work_port_events & WORKER_ELS_TMO;
-	if ((!tmo_posted) && (!(vport->load_flag & FC_UNLOADING)))
+	if (!tmo_posted && !test_bit(FC_UNLOADING, &vport->load_flag))
 		vport->work_port_events |= WORKER_ELS_TMO;
 	spin_unlock_irqrestore(&vport->work_port_lock, iflag);
 
-	if ((!tmo_posted) && (!(vport->load_flag & FC_UNLOADING)))
+	if (!tmo_posted && !test_bit(FC_UNLOADING, &vport->load_flag))
 		lpfc_worker_wake_up(phba);
 	return;
 }
@@ -9301,7 +9433,7 @@ lpfc_els_timeout_handler(struct lpfc_vport *vport)
 	if (unlikely(!pring))
 		return;
 
-	if (phba->pport->load_flag & FC_UNLOADING)
+	if (test_bit(FC_UNLOADING, &phba->pport->load_flag))
 		return;
 
 	spin_lock_irq(&phba->hbalock);
@@ -9329,7 +9461,7 @@ lpfc_els_timeout_handler(struct lpfc_vport *vport)
 		if (piocb->vport != vport)
 			continue;
 
-		pcmd = (struct lpfc_dmabuf *) piocb->context2;
+		pcmd = piocb->cmd_dmabuf;
 		if (pcmd)
 			els_command = *(uint32_t *) (pcmd->virt);
 
@@ -9377,7 +9509,7 @@ lpfc_els_timeout_handler(struct lpfc_vport *vport)
 	lpfc_issue_hb_tmo(phba);
 
 	if (!list_empty(&pring->txcmplq))
-		if (!(phba->pport->load_flag & FC_UNLOADING))
+		if (!test_bit(FC_UNLOADING, &phba->pport->load_flag))
 			mod_timer(&vport->els_tmofunc,
 				  jiffies + msecs_to_jiffies(1000 * timeout));
 }
@@ -9406,11 +9538,13 @@ void
 lpfc_els_flush_cmd(struct lpfc_vport *vport)
 {
 	LIST_HEAD(abort_list);
+	LIST_HEAD(cancel_list);
 	struct lpfc_hba  *phba = vport->phba;
 	struct lpfc_sli_ring *pring;
 	struct lpfc_iocbq *tmp_iocb, *piocb;
 	u32 ulp_command;
 	unsigned long iflags = 0;
+	bool mbx_tmo_err;
 
 	lpfc_fabric_abort_vport(vport);
 
@@ -9432,22 +9566,34 @@ lpfc_els_flush_cmd(struct lpfc_vport *vport)
 	if (phba->sli_rev == LPFC_SLI_REV4)
 		spin_lock(&pring->ring_lock);
 
+	mbx_tmo_err = test_bit(MBX_TMO_ERR, &phba->bit_flags);
 	/* First we need to issue aborts to outstanding cmds on txcmpl */
 	list_for_each_entry_safe(piocb, tmp_iocb, &pring->txcmplq, list) {
-		if (piocb->cmd_flag & LPFC_IO_LIBDFC)
-			continue;
+		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
+				 "2243 iotag = 0x%x cmd_flag = 0x%x "
+				 "ulp_command = 0x%x this_vport %x "
+				 "sli_flag = 0x%x\n",
+				 piocb->iotag, piocb->cmd_flag,
+				 get_job_cmnd(phba, piocb),
+				 (piocb->vport == vport),
+				 phba->sli.sli_flag);
 
 		if (piocb->vport != vport)
 			continue;
 
-		if (piocb->cmd_flag & LPFC_DRIVER_ABORTED)
-			continue;
+		if ((phba->sli.sli_flag & LPFC_SLI_ACTIVE) && !mbx_tmo_err) {
+			if (piocb->cmd_flag & LPFC_IO_LIBDFC)
+				continue;
+			if (piocb->cmd_flag & LPFC_DRIVER_ABORTED)
+				continue;
+		}
 
-		/* On the ELS ring we can have ELS_REQUESTs or
-		 * GEN_REQUESTs waiting for a response.
+		/* On the ELS ring we can have ELS_REQUESTs, ELS_RSPs,
+		 * or GEN_REQUESTs waiting for a CQE response.
 		 */
 		ulp_command = get_job_cmnd(phba, piocb);
-		if (ulp_command == CMD_ELS_REQUEST64_CR) {
+		if (ulp_command == CMD_ELS_REQUEST64_WQE ||
+		    ulp_command == CMD_XMIT_ELS_RSP64_WQE) {
 			list_add_tail(&piocb->dlist, &abort_list);
 
 			/* If the link is down when flushing ELS commands
@@ -9459,8 +9605,8 @@ lpfc_els_flush_cmd(struct lpfc_vport *vport)
 			 */
 			if (phba->link_state == LPFC_LINK_DOWN)
 				piocb->cmd_cmpl = lpfc_cmpl_els_link_down;
-		}
-		if (ulp_command == CMD_GEN_REQUEST64_CR)
+		} else if (ulp_command == CMD_GEN_REQUEST64_CR ||
+			   mbx_tmo_err)
 			list_add_tail(&piocb->dlist, &abort_list);
 	}
 
@@ -9472,11 +9618,19 @@ lpfc_els_flush_cmd(struct lpfc_vport *vport)
 	list_for_each_entry_safe(piocb, tmp_iocb, &abort_list, dlist) {
 		spin_lock_irqsave(&phba->hbalock, iflags);
 		list_del_init(&piocb->dlist);
-		lpfc_sli_issue_abort_iotag(phba, pring, piocb, NULL);
+		if (mbx_tmo_err || !(phba->sli.sli_flag & LPFC_SLI_ACTIVE))
+			list_move_tail(&piocb->list, &cancel_list);
+		else
+			lpfc_sli_issue_abort_iotag(phba, pring, piocb, NULL);
+
 		spin_unlock_irqrestore(&phba->hbalock, iflags);
 	}
-	/* Make sure HBA is alive */
-	lpfc_issue_hb_tmo(phba);
+	if (!list_empty(&cancel_list))
+		lpfc_sli_cancel_iocbs(phba, &cancel_list, IOSTAT_LOCAL_REJECT,
+				      IOERR_SLI_ABORTED);
+	else
+		/* Make sure HBA is alive */
+		lpfc_issue_hb_tmo(phba);
 
 	if (!list_empty(&abort_list))
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
@@ -9584,7 +9738,7 @@ lpfc_send_els_failure_event(struct lpfc_hba *phba,
 	uint32_t *pcmd;
 	u32 ulp_status, ulp_word4;
 
-	ndlp = cmdiocbp->context1;
+	ndlp = cmdiocbp->ndlp;
 	if (!ndlp)
 		return;
 
@@ -9598,8 +9752,7 @@ lpfc_send_els_failure_event(struct lpfc_hba *phba,
 			sizeof(struct lpfc_name));
 		memcpy(lsrjt_event.header.wwnn, &ndlp->nlp_nodename,
 			sizeof(struct lpfc_name));
-		pcmd = (uint32_t *) (((struct lpfc_dmabuf *)
-			cmdiocbp->context2)->virt);
+		pcmd = (uint32_t *)cmdiocbp->cmd_dmabuf->virt;
 		lsrjt_event.command = (pcmd != NULL) ? *pcmd : 0;
 		stat.un.ls_rjt_error_be = cpu_to_be32(ulp_word4);
 		lsrjt_event.reason_code = stat.un.b.lsRjtRsnCode;
@@ -9875,6 +10028,9 @@ lpfc_els_rcv_fpin_peer_cgn(struct lpfc_hba *phba, struct fc_tlv_desc *tlv)
 	pc_evt_str = lpfc_get_fpin_congn_event_nm(pc_evt);
 	cnt = be32_to_cpu(pc->pname_count);
 
+	/* Capture FPIN frequency */
+	phba->cgn_fpin_frequency = be32_to_cpu(pc->event_period);
+
 	lpfc_printf_log(phba, KERN_INFO, LOG_CGN_MGMT | LOG_ELS,
 			"4684 FPIN Peer Congestion %s (x%x) "
 			"Duration %d mSecs "
@@ -9940,11 +10096,14 @@ lpfc_els_rcv_fpin_cgn(struct lpfc_hba *phba, struct fc_tlv_desc *tlv)
 			/* Take action here for an Alarm event */
 			if (phba->cmf_active_mode != LPFC_CFG_OFF) {
 				if (phba->cgn_reg_fpin & LPFC_CGN_FPIN_ALARM) {
-					/* Track of alarm cnt for cgn_info */
-					atomic_inc(&phba->cgn_fabric_alarm_cnt);
 					/* Track of alarm cnt for SYNC_WQE */
 					atomic_inc(&phba->cgn_sync_alarm_cnt);
 				}
+				/* Track alarm cnt for cgn_info regardless
+				 * of whether CMF is configured for Signals
+				 * or FPINs.
+				 */
+				atomic_inc(&phba->cgn_fabric_alarm_cnt);
 				goto cleanup;
 			}
 			break;
@@ -9952,11 +10111,14 @@ lpfc_els_rcv_fpin_cgn(struct lpfc_hba *phba, struct fc_tlv_desc *tlv)
 			/* Take action here for a Warning event */
 			if (phba->cmf_active_mode != LPFC_CFG_OFF) {
 				if (phba->cgn_reg_fpin & LPFC_CGN_FPIN_WARN) {
-					/* Track of warning cnt for cgn_info */
-					atomic_inc(&phba->cgn_fabric_warn_cnt);
 					/* Track of warning cnt for SYNC_WQE */
 					atomic_inc(&phba->cgn_sync_warn_cnt);
 				}
+				/* Track warning cnt and freq for cgn_info
+				 * regardless of whether CMF is configured for
+				 * Signals or FPINs.
+				 */
+				atomic_inc(&phba->cgn_fabric_warn_cnt);
 cleanup:
 				/* Save frequency in ms */
 				phba->cgn_fpin_frequency =
@@ -9965,14 +10127,10 @@ cleanup:
 				if (phba->cgn_i) {
 					cp = (struct lpfc_cgn_info *)
 						phba->cgn_i->virt;
-					if (phba->cgn_reg_fpin &
-						LPFC_CGN_FPIN_ALARM)
-						cp->cgn_alarm_freq =
-							cpu_to_le16(value);
-					if (phba->cgn_reg_fpin &
-						LPFC_CGN_FPIN_WARN)
-						cp->cgn_warn_freq =
-							cpu_to_le16(value);
+					cp->cgn_alarm_freq =
+						cpu_to_le16(value);
+					cp->cgn_warn_freq =
+						cpu_to_le16(value);
 					crc = lpfc_cgn_calc_crc32
 						(cp,
 						LPFC_CGN_INFO_SZ,
@@ -10102,7 +10260,7 @@ lpfc_els_rcv_fpin(struct lpfc_vport *vport, void *p, u32 fpin_length)
 		/* Send every descriptor individually to the upper layer */
 		if (deliver)
 			fc_host_fpin_rcv(lpfc_shost_from_vport(vport),
-					 fpin_length, (char *)fpin);
+					 fpin_length, (char *)fpin, 0);
 		desc_cnt++;
 	}
 }
@@ -10133,12 +10291,12 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	struct lpfc_wcqe_complete *wcqe_cmpl = NULL;
 	LPFC_MBOXQ_t *mbox;
 
-	if (!vport || !(elsiocb->context2))
+	if (!vport || !elsiocb->cmd_dmabuf)
 		goto dropit;
 
 	newnode = 0;
 	wcqe_cmpl = &elsiocb->wcqe_cmpl;
-	payload = ((struct lpfc_dmabuf *)elsiocb->context2)->virt;
+	payload = elsiocb->cmd_dmabuf->virt;
 	if (phba->sli_rev == LPFC_SLI_REV4)
 		payload_len = wcqe_cmpl->total_data_placed;
 	else
@@ -10161,12 +10319,12 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		goto dropit;
 
 	/* Ignore traffic received during vport shutdown. */
-	if (vport->load_flag & FC_UNLOADING)
+	if (test_bit(FC_UNLOADING, &vport->load_flag))
 		goto dropit;
 
 	/* If NPort discovery is delayed drop incoming ELS */
-	if ((vport->fc_flag & FC_DISC_DELAYED) &&
-			(cmd != ELS_CMD_PLOGI))
+	if (test_bit(FC_DISC_DELAYED, &vport->fc_flag) &&
+	    cmd != ELS_CMD_PLOGI)
 		goto dropit;
 
 	ndlp = lpfc_findnode_did(vport, did);
@@ -10190,17 +10348,14 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	 * Do not process any unsolicited ELS commands
 	 * if the ndlp is in DEV_LOSS
 	 */
-	spin_lock_irq(&ndlp->lock);
-	if (ndlp->nlp_flag & NLP_IN_DEV_LOSS) {
-		spin_unlock_irq(&ndlp->lock);
+	if (test_bit(NLP_IN_DEV_LOSS, &ndlp->nlp_flag)) {
 		if (newnode)
 			lpfc_nlp_put(ndlp);
 		goto dropit;
 	}
-	spin_unlock_irq(&ndlp->lock);
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1)
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp)
 		goto dropit;
 	elsiocb->vport = vport;
 
@@ -10210,14 +10365,14 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	/* ELS command <elsCmd> received from NPORT <did> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "0112 ELS command x%x received from NPORT x%x "
-			 "refcnt %d Data: x%x x%x x%x x%x\n",
+			 "refcnt %d Data: x%x x%lx x%x x%x\n",
 			 cmd, did, kref_read(&ndlp->kref), vport->port_state,
 			 vport->fc_flag, vport->fc_myDID, vport->fc_prevDID);
 
 	/* reject till our FLOGI completes or PLOGI assigned DID via PT2PT */
 	if ((vport->port_state < LPFC_FABRIC_CFG_LINK) &&
 	    (cmd != ELS_CMD_FLOGI) &&
-	    !((cmd == ELS_CMD_PLOGI) && (vport->fc_flag & FC_PT2PT))) {
+	    !((cmd == ELS_CMD_PLOGI) && test_bit(FC_PT2PT, &vport->fc_flag))) {
 		rjt_err = LSRJT_LOGICAL_BSY;
 		rjt_exp = LSEXP_NOTHING_MORE;
 		goto lsrjt;
@@ -10226,13 +10381,13 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	switch (cmd) {
 	case ELS_CMD_PLOGI:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV PLOGI:       did:x%x/ste:x%x flg:x%x",
+			"RCV PLOGI:       did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvPLOGI++;
 		ndlp = lpfc_plogi_confirm_nport(phba, payload, ndlp);
 		if (phba->sli_rev == LPFC_SLI_REV4 &&
-		    (phba->pport->fc_flag & FC_PT2PT)) {
+		    test_bit(FC_PT2PT, &phba->pport->fc_flag)) {
 			vport->fc_prevDID = vport->fc_myDID;
 			/* Our DID needs to be updated before registering
 			 * the vfi. This is done in lpfc_rcv_plogi but
@@ -10250,24 +10405,20 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		lpfc_send_els_event(vport, ndlp, payload);
 
 		/* If Nport discovery is delayed, reject PLOGIs */
-		if (vport->fc_flag & FC_DISC_DELAYED) {
+		if (test_bit(FC_DISC_DELAYED, &vport->fc_flag)) {
 			rjt_err = LSRJT_UNABLE_TPC;
 			rjt_exp = LSEXP_NOTHING_MORE;
 			break;
 		}
 
 		if (vport->port_state < LPFC_DISC_AUTH) {
-			if (!(phba->pport->fc_flag & FC_PT2PT) ||
-				(phba->pport->fc_flag & FC_PT2PT_PLOGI)) {
+			if (!test_bit(FC_PT2PT, &phba->pport->fc_flag) ||
+			    test_bit(FC_PT2PT_PLOGI, &phba->pport->fc_flag)) {
 				rjt_err = LSRJT_UNABLE_TPC;
 				rjt_exp = LSEXP_NOTHING_MORE;
 				break;
 			}
 		}
-
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag &= ~NLP_TARGET_REMOVE;
-		spin_unlock_irq(&ndlp->lock);
 
 		lpfc_disc_state_machine(vport, ndlp, elsiocb,
 					NLP_EVT_RCV_PLOGI);
@@ -10275,7 +10426,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_FLOGI:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV FLOGI:       did:x%x/ste:x%x flg:x%x",
+			"RCV FLOGI:       did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvFLOGI++;
@@ -10284,7 +10435,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		 * bounce the link.  There is some descrepancy.
 		 */
 		if (vport->port_state >= LPFC_LOCAL_CFG_LINK &&
-		    vport->fc_flag & FC_PT2PT &&
+		    test_bit(FC_PT2PT, &vport->fc_flag) &&
 		    vport->rcv_flogi_cnt >= 1) {
 			rjt_err = LSRJT_LOGICAL_BSY;
 			rjt_exp = LSEXP_NOTHING_MORE;
@@ -10294,7 +10445,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 
 		lpfc_els_rcv_flogi(vport, elsiocb, ndlp);
 		/* retain node if our response is deferred */
-		if (phba->defer_flogi_acc_flag)
+		if (phba->defer_flogi_acc.flag)
 			break;
 		if (newnode)
 			lpfc_disc_state_machine(vport, ndlp, NULL,
@@ -10302,7 +10453,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_LOGO:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV LOGO:        did:x%x/ste:x%x flg:x%x",
+			"RCV LOGO:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvLOGO++;
@@ -10319,7 +10470,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_PRLO:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV PRLO:        did:x%x/ste:x%x flg:x%x",
+			"RCV PRLO:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvPRLO++;
@@ -10348,7 +10499,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_ADISC:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV ADISC:       did:x%x/ste:x%x flg:x%x",
+			"RCV ADISC:       did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		lpfc_send_els_event(vport, ndlp, payload);
@@ -10363,7 +10514,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_PDISC:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV PDISC:       did:x%x/ste:x%x flg:x%x",
+			"RCV PDISC:       did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvPDISC++;
@@ -10377,7 +10528,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_FARPR:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV FARPR:       did:x%x/ste:x%x flg:x%x",
+			"RCV FARPR:       did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvFARPR++;
@@ -10385,7 +10536,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_FARP:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV FARP:        did:x%x/ste:x%x flg:x%x",
+			"RCV FARP:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvFARP++;
@@ -10393,7 +10544,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_FAN:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV FAN:         did:x%x/ste:x%x flg:x%x",
+			"RCV FAN:         did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvFAN++;
@@ -10402,12 +10553,12 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	case ELS_CMD_PRLI:
 	case ELS_CMD_NVMEPRLI:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV PRLI:        did:x%x/ste:x%x flg:x%x",
+			"RCV PRLI:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvPRLI++;
 		if ((vport->port_state < LPFC_DISC_AUTH) &&
-		    (vport->fc_flag & FC_FABRIC)) {
+		    test_bit(FC_FABRIC, &vport->fc_flag)) {
 			rjt_err = LSRJT_UNABLE_TPC;
 			rjt_exp = LSEXP_NOTHING_MORE;
 			break;
@@ -10416,7 +10567,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_LIRR:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV LIRR:        did:x%x/ste:x%x flg:x%x",
+			"RCV LIRR:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvLIRR++;
@@ -10427,7 +10578,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_RLS:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RLS:         did:x%x/ste:x%x flg:x%x",
+			"RCV RLS:         did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvRLS++;
@@ -10438,7 +10589,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_RPL:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RPL:         did:x%x/ste:x%x flg:x%x",
+			"RCV RPL:         did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvRPL++;
@@ -10449,7 +10600,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_RNID:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RNID:        did:x%x/ste:x%x flg:x%x",
+			"RCV RNID:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvRNID++;
@@ -10460,7 +10611,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_RTV:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RTV:        did:x%x/ste:x%x flg:x%x",
+			"RCV RTV:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 		phba->fc_stat.elsRcvRTV++;
 		lpfc_els_rcv_rtv(vport, elsiocb, ndlp);
@@ -10470,7 +10621,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_RRQ:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV RRQ:         did:x%x/ste:x%x flg:x%x",
+			"RCV RRQ:         did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvRRQ++;
@@ -10481,7 +10632,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_ECHO:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-			"RCV ECHO:        did:x%x/ste:x%x flg:x%x",
+			"RCV ECHO:        did:x%x/ste:x%x flg:x%lx",
 			did, vport->port_state, ndlp->nlp_flag);
 
 		phba->fc_stat.elsRcvECHO++;
@@ -10497,7 +10648,8 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		break;
 	case ELS_CMD_FPIN:
 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
-				      "RCV FPIN:       did:x%x/ste:x%x flg:x%x",
+				      "RCV FPIN:       did:x%x/ste:x%x "
+				      "flg:x%lx",
 				      did, vport->port_state, ndlp->nlp_flag);
 
 		lpfc_els_rcv_fpin(vport, (struct fc_els_fpin *)payload,
@@ -10532,7 +10684,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		rjt_exp = LSEXP_NOTHING_MORE;
 
 		/* Unknown ELS command <elsCmd> received from NPORT <did> */
-		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
+		lpfc_printf_vlog(vport, KERN_ERR, LOG_ELS,
 				 "0115 Unknown ELS command x%x "
 				 "received from NPORT x%x\n", cmd, did);
 		if (newnode)
@@ -10556,8 +10708,8 @@ lsrjt:
 	}
 
 	/* Release the reference on this elsiocb, not the ndlp. */
-	lpfc_nlp_put(elsiocb->context1);
-	elsiocb->context1 = NULL;
+	lpfc_nlp_put(elsiocb->ndlp);
+	elsiocb->ndlp = NULL;
 
 	/* Special case.  Driver received an unsolicited command that
 	 * unsupportable given the driver's current state.  Reset the
@@ -10582,7 +10734,7 @@ lsrjt:
 	return;
 
 dropit:
-	if (vport && !(vport->load_flag & FC_UNLOADING))
+	if (vport && !test_bit(FC_UNLOADING, &vport->load_flag))
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 			"0111 Dropping received ELS cmd "
 			"Data: x%x x%x x%x x%x\n",
@@ -10611,13 +10763,13 @@ lpfc_els_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	u32 ulp_command, status, parameter, bde_count = 0;
 	IOCB_t *icmd;
 	struct lpfc_wcqe_complete *wcqe_cmpl = NULL;
-	struct lpfc_dmabuf *bdeBuf1 = elsiocb->context2;
-	struct lpfc_dmabuf *bdeBuf2 = elsiocb->context3;
+	struct lpfc_dmabuf *bdeBuf1 = elsiocb->cmd_dmabuf;
+	struct lpfc_dmabuf *bdeBuf2 = elsiocb->bpl_dmabuf;
 	dma_addr_t paddr;
 
-	elsiocb->context1 = NULL;
-	elsiocb->context2 = NULL;
-	elsiocb->context3 = NULL;
+	elsiocb->cmd_dmabuf = NULL;
+	elsiocb->rsp_dmabuf = NULL;
+	elsiocb->bpl_dmabuf = NULL;
 
 	wcqe_cmpl = &elsiocb->wcqe_cmpl;
 	ulp_command = get_job_cmnd(phba, elsiocb);
@@ -10661,38 +10813,39 @@ lpfc_els_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 
 	/* Account for SLI2 or SLI3 and later unsolicited buffering */
 	if (phba->sli3_options & LPFC_SLI3_HBQ_ENABLED) {
-		elsiocb->context2 = bdeBuf1;
+		elsiocb->cmd_dmabuf = bdeBuf1;
 		if (bde_count == 2)
-			elsiocb->context3 = bdeBuf2;
+			elsiocb->bpl_dmabuf = bdeBuf2;
 	} else {
 		icmd = &elsiocb->iocb;
 		paddr = getPaddr(icmd->un.cont64[0].addrHigh,
 				 icmd->un.cont64[0].addrLow);
-		elsiocb->context2 = lpfc_sli_ringpostbuf_get(phba, pring,
-							     paddr);
+		elsiocb->cmd_dmabuf = lpfc_sli_ringpostbuf_get(phba, pring,
+							       paddr);
 		if (bde_count == 2) {
 			paddr = getPaddr(icmd->un.cont64[1].addrHigh,
 					 icmd->un.cont64[1].addrLow);
-			elsiocb->context3 = lpfc_sli_ringpostbuf_get(phba,
-								       pring,
-								       paddr);
+			elsiocb->bpl_dmabuf = lpfc_sli_ringpostbuf_get(phba,
+									pring,
+									paddr);
 		}
 	}
 
 	lpfc_els_unsol_buffer(phba, pring, vport, elsiocb);
 	/*
 	 * The different unsolicited event handlers would tell us
-	 * if they are done with "mp" by setting context2 to NULL.
+	 * if they are done with "mp" by setting cmd_dmabuf to NULL.
 	 */
-	if (elsiocb->context2) {
-		lpfc_in_buf_free(phba, (struct lpfc_dmabuf *)elsiocb->context2);
-		elsiocb->context2 = NULL;
+	if (elsiocb->cmd_dmabuf) {
+		lpfc_in_buf_free(phba, elsiocb->cmd_dmabuf);
+		elsiocb->cmd_dmabuf = NULL;
 	}
 
-	if (elsiocb->context3) {
-		lpfc_in_buf_free(phba, elsiocb->context3);
-		elsiocb->context3 = NULL;
+	if (elsiocb->bpl_dmabuf) {
+		lpfc_in_buf_free(phba, elsiocb->bpl_dmabuf);
+		elsiocb->bpl_dmabuf = NULL;
 	}
+
 }
 
 static void
@@ -10735,16 +10888,13 @@ void
 lpfc_do_scr_ns_plogi(struct lpfc_hba *phba, struct lpfc_vport *vport)
 {
 	struct lpfc_nodelist *ndlp;
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 
 	/*
 	 * If lpfc_delay_discovery parameter is set and the clean address
 	 * bit is cleared and fc fabric parameters chenged, delay FC NPort
 	 * discovery.
 	 */
-	spin_lock_irq(shost->host_lock);
-	if (vport->fc_flag & FC_DISC_DELAYED) {
-		spin_unlock_irq(shost->host_lock);
+	if (test_bit(FC_DISC_DELAYED, &vport->fc_flag)) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 				 "3334 Delay fc port discovery for %d secs\n",
 				 phba->fc_ratov);
@@ -10752,7 +10902,6 @@ lpfc_do_scr_ns_plogi(struct lpfc_hba *phba, struct lpfc_vport *vport)
 			jiffies + msecs_to_jiffies(1000 * phba->fc_ratov));
 		return;
 	}
-	spin_unlock_irq(shost->host_lock);
 
 	ndlp = lpfc_findnode_did(vport, NameServer_DID);
 	if (!ndlp) {
@@ -10781,8 +10930,8 @@ lpfc_do_scr_ns_plogi(struct lpfc_hba *phba, struct lpfc_vport *vport)
 	}
 
 	if ((phba->cfg_enable_SmartSAN ||
-	     (phba->cfg_fdmi_on == LPFC_FDMI_SUPPORT)) &&
-	     (vport->load_flag & FC_ALLOW_FDMI))
+	     phba->cfg_fdmi_on == LPFC_FDMI_SUPPORT) &&
+	    test_bit(FC_ALLOW_FDMI, &vport->load_flag))
 		lpfc_start_fdmi(vport);
 }
 
@@ -10802,14 +10951,12 @@ static void
 lpfc_cmpl_reg_new_vport(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 {
 	struct lpfc_vport *vport = pmb->vport;
-	struct Scsi_Host  *shost = lpfc_shost_from_vport(vport);
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *)pmb->ctx_ndlp;
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
+	struct lpfc_nodelist *ndlp = pmb->ctx_ndlp;
 	MAILBOX_t *mb = &pmb->u.mb;
 	int rc;
 
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~FC_VPORT_NEEDS_REG_VPI;
-	spin_unlock_irq(shost->host_lock);
+	clear_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 
 	if (mb->mbxStatus) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
@@ -10826,16 +10973,13 @@ lpfc_cmpl_reg_new_vport(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 		case 0x9602:	/* Link event since CLEAR_LA */
 			/* giving up on vport registration */
 			lpfc_vport_set_state(vport, FC_VPORT_FAILED);
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag &= ~(FC_FABRIC | FC_PUBLIC_LOOP);
-			spin_unlock_irq(shost->host_lock);
+			clear_bit(FC_FABRIC, &vport->fc_flag);
+			clear_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
 			lpfc_can_disctmo(vport);
 			break;
 		/* If reg_vpi fail with invalid VPI status, re-init VPI */
 		case 0x20:
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
-			spin_unlock_irq(shost->host_lock);
+			set_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 			lpfc_init_vpi(phba, pmb, vport->vpi);
 			pmb->vport = vport;
 			pmb->mbox_cmpl = lpfc_init_vpi_cmpl;
@@ -10856,13 +11000,11 @@ lpfc_cmpl_reg_new_vport(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 			if (phba->sli_rev == LPFC_SLI_REV4)
 				lpfc_sli4_unreg_all_rpis(vport);
 			lpfc_mbx_unreg_vpi(vport);
-			spin_lock_irq(shost->host_lock);
-			vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
-			spin_unlock_irq(shost->host_lock);
+			set_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 			if (mb->mbxStatus == MBX_NOT_FINISHED)
 				break;
 			if ((vport->port_type == LPFC_PHYSICAL_PORT) &&
-			    !(vport->fc_flag & FC_LOGO_RCVD_DID_CHNG)) {
+			    !test_bit(FC_LOGO_RCVD_DID_CHNG, &vport->fc_flag)) {
 				if (phba->sli_rev == LPFC_SLI_REV4)
 					lpfc_issue_init_vfi(vport);
 				else
@@ -10899,6 +11041,14 @@ mbox_err_exit:
 	lpfc_nlp_put(ndlp);
 
 	mempool_free(pmb, phba->mbox_mem_pool);
+
+	/* reinitialize the VMID datastructure before returning.
+	 * this is specifically for vport
+	 */
+	if (lpfc_is_vmid_enabled(phba))
+		lpfc_reinit_vmid(vport);
+	vport->vmid_flag = vport->phba->pport->vmid_flag;
+
 	return;
 }
 
@@ -10915,7 +11065,6 @@ void
 lpfc_register_new_vport(struct lpfc_hba *phba, struct lpfc_vport *vport,
 			struct lpfc_nodelist *ndlp)
 {
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	LPFC_MBOXQ_t *mbox;
 
 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
@@ -10950,9 +11099,7 @@ lpfc_register_new_vport(struct lpfc_hba *phba, struct lpfc_vport *vport,
 
 mbox_err_exit:
 	lpfc_vport_set_state(vport, FC_VPORT_FAILED);
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~FC_VPORT_NEEDS_REG_VPI;
-	spin_unlock_irq(shost->host_lock);
+	clear_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 	return;
 }
 
@@ -11010,9 +11157,7 @@ lpfc_retry_pport_discovery(struct lpfc_hba *phba)
 		return;
 
 	mod_timer(&ndlp->nlp_delayfunc, jiffies + msecs_to_jiffies(1000));
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_DELAY_TMO;
-	spin_unlock_irq(&ndlp->lock);
+	set_bit(NLP_DELAY_TMO, &ndlp->nlp_flag);
 	ndlp->nlp_last_elscmd = ELS_CMD_FLOGI;
 	phba->pport->port_state = LPFC_FLOGI;
 	return;
@@ -11067,12 +11212,11 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		    struct lpfc_iocbq *rspiocb)
 {
 	struct lpfc_vport *vport = cmdiocb->vport;
-	struct Scsi_Host  *shost = lpfc_shost_from_vport(vport);
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *) cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 	struct lpfc_nodelist *np;
 	struct lpfc_nodelist *next_np;
 	struct lpfc_iocbq *piocb;
-	struct lpfc_dmabuf *pcmd = cmdiocb->context2, *prsp;
+	struct lpfc_dmabuf *pcmd = cmdiocb->cmd_dmabuf, *prsp;
 	struct serv_parm *sp;
 	uint8_t fabric_param_changed;
 	u32 ulp_status, ulp_word4;
@@ -11106,28 +11250,29 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* Check for retry */
 		if (lpfc_els_retry(phba, cmdiocb, rspiocb))
 			goto out;
-		/* FDISC failed */
-		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
-				 "0126 FDISC failed. (x%x/x%x)\n",
-				 ulp_status, ulp_word4);
+		/* Warn FDISC status */
+		lpfc_vlog_msg(vport, KERN_WARNING, LOG_ELS,
+			      "0126 FDISC cmpl status: x%x/x%x)\n",
+			      ulp_status, ulp_word4);
 		goto fdisc_failed;
 	}
 
 	lpfc_check_nlp_post_devloss(vport, ndlp);
 
-	spin_lock_irq(shost->host_lock);
-	vport->fc_flag &= ~FC_VPORT_CVL_RCVD;
-	vport->fc_flag &= ~FC_VPORT_LOGO_RCVD;
-	vport->fc_flag |= FC_FABRIC;
+	clear_bit(FC_VPORT_CVL_RCVD, &vport->fc_flag);
+	clear_bit(FC_VPORT_LOGO_RCVD, &vport->fc_flag);
+	set_bit(FC_FABRIC, &vport->fc_flag);
 	if (vport->phba->fc_topology == LPFC_TOPOLOGY_LOOP)
-		vport->fc_flag |=  FC_PUBLIC_LOOP;
-	spin_unlock_irq(shost->host_lock);
+		set_bit(FC_PUBLIC_LOOP, &vport->fc_flag);
 
 	vport->fc_myDID = ulp_word4 & Mask_DID;
 	lpfc_vport_set_state(vport, FC_VPORT_ACTIVE);
 	prsp = list_get_first(&pcmd->list, struct lpfc_dmabuf, list);
 	if (!prsp)
 		goto out;
+	if (!lpfc_is_els_acc_rsp(prsp))
+		goto out;
+
 	sp = prsp->virt + sizeof(uint32_t);
 	fabric_param_changed = lpfc_check_clean_addr_bit(vport, sp);
 	memcpy(&vport->fabric_portname, &sp->portName,
@@ -11135,7 +11280,7 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	memcpy(&vport->fabric_nodename, &sp->nodeName,
 		sizeof(struct lpfc_name));
 	if (fabric_param_changed &&
-		!(vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)) {
+		!test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag)) {
 		/* If our NportID changed, we need to ensure all
 		 * remaining NPORTs get unreg_login'ed so we can
 		 * issue unreg_vpi.
@@ -11143,11 +11288,9 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		list_for_each_entry_safe(np, next_np,
 			&vport->fc_nodes, nlp_listp) {
 			if ((np->nlp_state != NLP_STE_NPR_NODE) ||
-			    !(np->nlp_flag & NLP_NPR_ADISC))
+			    !test_bit(NLP_NPR_ADISC, &np->nlp_flag))
 				continue;
-			spin_lock_irq(&ndlp->lock);
-			np->nlp_flag &= ~NLP_NPR_ADISC;
-			spin_unlock_irq(&ndlp->lock);
+			clear_bit(NLP_NPR_ADISC, &np->nlp_flag);
 			lpfc_unreg_rpi(vport, np);
 		}
 		lpfc_cleanup_pending_mbox(vport);
@@ -11156,15 +11299,13 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			lpfc_sli4_unreg_all_rpis(vport);
 
 		lpfc_mbx_unreg_vpi(vport);
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
+		set_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 		if (phba->sli_rev == LPFC_SLI_REV4)
-			vport->fc_flag |= FC_VPORT_NEEDS_INIT_VPI;
+			set_bit(FC_VPORT_NEEDS_INIT_VPI, &vport->fc_flag);
 		else
-			vport->fc_flag |= FC_LOGO_RCVD_DID_CHNG;
-		spin_unlock_irq(shost->host_lock);
+			set_bit(FC_LOGO_RCVD_DID_CHNG, &vport->fc_flag);
 	} else if ((phba->sli_rev == LPFC_SLI_REV4) &&
-		!(vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)) {
+		   !test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag)) {
 		/*
 		 * Driver needs to re-reg VPI in order for f/w
 		 * to update the MAC address.
@@ -11174,9 +11315,9 @@ lpfc_cmpl_els_fdisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		goto out;
 	}
 
-	if (vport->fc_flag & FC_VPORT_NEEDS_INIT_VPI)
+	if (test_bit(FC_VPORT_NEEDS_INIT_VPI, &vport->fc_flag))
 		lpfc_issue_init_vpi(vport);
-	else if (vport->fc_flag & FC_VPORT_NEEDS_REG_VPI)
+	else if (test_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag))
 		lpfc_register_new_vport(phba, vport, ndlp);
 	else
 		lpfc_do_scr_ns_plogi(phba, vport);
@@ -11210,7 +11351,7 @@ out:
  * IOCB will be sent off HBA at any given time.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the FDISC ELS command.
  *
  * Return code
@@ -11255,7 +11396,7 @@ lpfc_issue_els_fdisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		icmd->ulpCt_l = 0;
 	}
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_FDISC;
 	pcmd += sizeof(uint32_t); /* CSP Word 1 */
 	memcpy(pcmd, &vport->phba->pport->fc_sparam, sizeof(struct serv_parm));
@@ -11287,8 +11428,8 @@ lpfc_issue_els_fdisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		"Issue FDISC:     did:x%x",
 		did, 0, 0);
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1)
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp)
 		goto err_out;
 
 	rc = lpfc_issue_fabric_iocb(phba, elsiocb);
@@ -11329,10 +11470,9 @@ lpfc_cmpl_els_npiv_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_vport *vport = cmdiocb->vport;
 	IOCB_t *irsp;
 	struct lpfc_nodelist *ndlp;
-	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	u32 ulp_status, ulp_word4, did, tmo;
 
-	ndlp = (struct lpfc_nodelist *)cmdiocb->context1;
+	ndlp = cmdiocb->ndlp;
 
 	ulp_status = get_job_ulpstatus(phba, rspiocb);
 	ulp_word4 = get_job_word4(phba, rspiocb);
@@ -11353,28 +11493,25 @@ lpfc_cmpl_els_npiv_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	/* NPIV LOGO completes to NPort <nlp_DID> */
 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
 			 "2928 NPIV LOGO completes to NPort x%x "
-			 "Data: x%x x%x x%x x%x x%x x%x x%x\n",
+			 "Data: x%x x%x x%x x%x x%x x%lx x%x\n",
 			 ndlp->nlp_DID, ulp_status, ulp_word4,
 			 tmo, vport->num_disc_nodes,
 			 kref_read(&ndlp->kref), ndlp->nlp_flag,
 			 ndlp->fc4_xpt_flags);
 
 	if (ulp_status == IOSTAT_SUCCESS) {
-		spin_lock_irq(shost->host_lock);
-		vport->fc_flag &= ~FC_NDISC_ACTIVE;
-		vport->fc_flag &= ~FC_FABRIC;
-		spin_unlock_irq(shost->host_lock);
+		clear_bit(FC_NDISC_ACTIVE, &vport->fc_flag);
+		clear_bit(FC_FABRIC, &vport->fc_flag);
 		lpfc_can_disctmo(vport);
 	}
 
-	if (ndlp->save_flags & NLP_WAIT_FOR_LOGO) {
+	if (test_bit(NLP_WAIT_FOR_LOGO, &ndlp->save_flags)) {
 		/* Wake up lpfc_vport_delete if waiting...*/
 		if (ndlp->logo_waitq)
 			wake_up(ndlp->logo_waitq);
-		spin_lock_irq(&ndlp->lock);
-		ndlp->nlp_flag &= ~(NLP_ISSUE_LOGO | NLP_LOGO_SND);
-		ndlp->save_flags &= ~NLP_WAIT_FOR_LOGO;
-		spin_unlock_irq(&ndlp->lock);
+		clear_bit(NLP_ISSUE_LOGO, &ndlp->nlp_flag);
+		clear_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
+		clear_bit(NLP_WAIT_FOR_LOGO, &ndlp->save_flags);
 	}
 
 	/* Safe to release resources now. */
@@ -11390,7 +11527,7 @@ lpfc_cmpl_els_npiv_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
  * This routine issues a LOGO ELS command to an @ndlp off a @vport.
  *
  * Note that the ndlp reference count will be incremented by 1 for holding the
- * ndlp and the reference to ndlp will be stored into the context1 field of
+ * ndlp and the reference to ndlp will be stored into the ndlp field of
  * the IOCB for the completion callback function to the LOGO ELS command.
  *
  * Return codes
@@ -11412,7 +11549,7 @@ lpfc_issue_els_npiv_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 	if (!elsiocb)
 		return 1;
 
-	pcmd = (uint8_t *) (((struct lpfc_dmabuf *) elsiocb->context2)->virt);
+	pcmd = (uint8_t *)elsiocb->cmd_dmabuf->virt;
 	*((uint32_t *) (pcmd)) = ELS_CMD_LOGO;
 	pcmd += sizeof(uint32_t);
 
@@ -11422,15 +11559,13 @@ lpfc_issue_els_npiv_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 	memcpy(pcmd, &vport->fc_portname, sizeof(struct lpfc_name));
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
-		"Issue LOGO npiv  did:x%x flg:x%x",
+		"Issue LOGO npiv  did:x%x flg:x%lx",
 		ndlp->nlp_DID, ndlp->nlp_flag, 0);
 
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_npiv_logo;
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_LOGO_SND;
-	spin_unlock_irq(&ndlp->lock);
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	set_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		goto err;
 	}
@@ -11444,9 +11579,7 @@ lpfc_issue_els_npiv_logo(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 	return 0;
 
 err:
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_LOGO_SND;
-	spin_unlock_irq(&ndlp->lock);
+	clear_bit(NLP_LOGO_SND, &ndlp->nlp_flag);
 	return 1;
 }
 
@@ -11821,7 +11954,7 @@ lpfc_sli4_vport_delete_els_xri_aborted(struct lpfc_vport *vport)
 			 * node and the vport is unloading, the xri aborted wcqe
 			 * likely isn't coming back.  Just release the sgl.
 			 */
-			if ((vport->load_flag & FC_UNLOADING) &&
+			if (test_bit(FC_UNLOADING, &vport->load_flag) &&
 			    ndlp->nlp_DID == Fabric_DID) {
 				list_del(&sglq_entry->list);
 				sglq_entry->state = SGL_FREED;
@@ -11927,7 +12060,7 @@ lpfc_sli_abts_recover_port(struct lpfc_vport *vport,
 	lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
 			"3094 Start rport recovery on shost id 0x%x "
 			"fc_id 0x%06x vpi 0x%x rpi 0x%x state 0x%x "
-			"flags 0x%x\n",
+			"flag 0x%lx\n",
 			shost->host_no, ndlp->nlp_DID,
 			vport->vpi, ndlp->nlp_rpi, ndlp->nlp_state,
 			ndlp->nlp_flag);
@@ -11937,8 +12070,8 @@ lpfc_sli_abts_recover_port(struct lpfc_vport *vport,
 	 */
 	spin_lock_irqsave(&ndlp->lock, flags);
 	ndlp->nlp_fcp_info &= ~NLP_FCP_2_DEVICE;
-	ndlp->nlp_flag |= NLP_ISSUE_LOGO;
 	spin_unlock_irqrestore(&ndlp->lock, flags);
+	set_bit(NLP_ISSUE_LOGO, &ndlp->nlp_flag);
 	lpfc_unreg_rpi(vport, ndlp);
 }
 
@@ -11989,12 +12122,12 @@ lpfc_cmpl_els_qfpa(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_dmabuf *prsp = NULL;
 	struct lpfc_vmid_priority_range *vmid_range = NULL;
 	u32 *data;
-	struct lpfc_dmabuf *dmabuf = cmdiocb->context2;
+	struct lpfc_dmabuf *dmabuf = cmdiocb->cmd_dmabuf;
 	u32 ulp_status = get_job_ulpstatus(phba, rspiocb);
 	u32 ulp_word4 = get_job_word4(phba, rspiocb);
 	u8 *pcmd, max_desc;
 	u32 len, i;
-	struct lpfc_nodelist *ndlp = (struct lpfc_nodelist *)cmdiocb->context1;
+	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
 
 	prsp = list_get_first(&dmabuf->list, struct lpfc_dmabuf, list);
 	if (!prsp)
@@ -12090,15 +12223,15 @@ int lpfc_issue_els_qfpa(struct lpfc_vport *vport)
 	if (!elsiocb)
 		return -ENOMEM;
 
-	pcmd = (u8 *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
 
 	*((u32 *)(pcmd)) = ELS_CMD_QFPA;
 	pcmd += 4;
 
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_qfpa;
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(vport->phba, elsiocb);
 		return -ENXIO;
 	}
@@ -12145,11 +12278,12 @@ lpfc_vmid_uvem(struct lpfc_vport *vport,
 	vmid_context->nlp = ndlp;
 	vmid_context->instantiated = instantiated;
 	elsiocb->vmid_tag.vmid_context = vmid_context;
-	pcmd = (u8 *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+	pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
 
-	if (uuid_is_null((uuid_t *)vport->lpfc_vmid_host_uuid))
+	if (!memchr_inv(vport->lpfc_vmid_host_uuid, 0,
+			sizeof(vport->lpfc_vmid_host_uuid)))
 		memcpy(vport->lpfc_vmid_host_uuid, vmid->host_vmid,
-		       LPFC_COMPRESS_VMID_SIZE);
+		       sizeof(vport->lpfc_vmid_host_uuid));
 
 	*((u32 *)(pcmd)) = ELS_CMD_UVEM;
 	len = (u32 *)(pcmd + 4);
@@ -12159,13 +12293,13 @@ lpfc_vmid_uvem(struct lpfc_vport *vport,
 	vem_id_desc->tag = be32_to_cpu(VEM_ID_DESC_TAG);
 	vem_id_desc->length = be32_to_cpu(LPFC_UVEM_VEM_ID_DESC_SIZE);
 	memcpy(vem_id_desc->vem_id, vport->lpfc_vmid_host_uuid,
-	       LPFC_COMPRESS_VMID_SIZE);
+	       sizeof(vem_id_desc->vem_id));
 
 	inst_desc = (struct instantiated_ve_desc *)(pcmd + 32);
 	inst_desc->tag = be32_to_cpu(INSTANTIATED_VE_DESC_TAG);
 	inst_desc->length = be32_to_cpu(LPFC_UVEM_VE_MAP_DESC_SIZE);
 	memcpy(inst_desc->global_vem_id, vmid->host_vmid,
-	       LPFC_COMPRESS_VMID_SIZE);
+	       sizeof(inst_desc->global_vem_id));
 
 	bf_set(lpfc_instantiated_nport_id, inst_desc, vport->fc_myDID);
 	bf_set(lpfc_instantiated_local_id, inst_desc,
@@ -12180,8 +12314,8 @@ lpfc_vmid_uvem(struct lpfc_vport *vport,
 
 	elsiocb->cmd_cmpl = lpfc_cmpl_els_uvem;
 
-	elsiocb->context1 = lpfc_nlp_get(ndlp);
-	if (!elsiocb->context1) {
+	elsiocb->ndlp = lpfc_nlp_get(ndlp);
+	if (!elsiocb->ndlp) {
 		lpfc_els_free_iocb(vport->phba, elsiocb);
 		goto out;
 	}
@@ -12207,12 +12341,12 @@ lpfc_cmpl_els_uvem(struct lpfc_hba *phba, struct lpfc_iocbq *icmdiocb,
 	struct lpfc_dmabuf *prsp = NULL;
 	struct lpfc_vmid_context *vmid_context =
 	    icmdiocb->vmid_tag.vmid_context;
-	struct lpfc_nodelist *ndlp = icmdiocb->context1;
+	struct lpfc_nodelist *ndlp = icmdiocb->ndlp;
 	u8 *pcmd;
 	u32 *data;
 	u32 ulp_status = get_job_ulpstatus(phba, rspiocb);
 	u32 ulp_word4 = get_job_word4(phba, rspiocb);
-	struct lpfc_dmabuf *dmabuf = icmdiocb->context2;
+	struct lpfc_dmabuf *dmabuf = icmdiocb->cmd_dmabuf;
 	struct lpfc_vmid *vmid;
 
 	vmid = vmid_context->vmp;

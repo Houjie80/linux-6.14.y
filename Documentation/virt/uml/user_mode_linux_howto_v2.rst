@@ -217,13 +217,13 @@ remote UML and other VM instances.
 +-----------+--------+------------------------------------+------------+
 | fd        | vector | dependent on fd type               | varies     |
 +-----------+--------+------------------------------------+------------+
+| vde       | vector | dep. on VDE VPN: Virt.Net Locator  | varies     |
++-----------+--------+------------------------------------+------------+
 | tuntap    | legacy | none                               | ~ 500Mbit  |
 +-----------+--------+------------------------------------+------------+
 | daemon    | legacy | none                               | ~ 450Mbit  |
 +-----------+--------+------------------------------------+------------+
 | socket    | legacy | none                               | ~ 450Mbit  |
-+-----------+--------+------------------------------------+------------+
-| pcap      | legacy | rx only                            | ~ 450Mbit  |
 +-----------+--------+------------------------------------+------------+
 | ethertap  | legacy | obsolete                           | ~ 500Mbit  |
 +-----------+--------+------------------------------------+------------+
@@ -322,7 +322,7 @@ Shared Options
 * ``v6=[0,1]`` to specify if a v6 connection is desired for all
   transports which operate over IP. Additionally, for transports that
   have some differences in the way they operate over v4 and v6 (for example
-  EoL2TPv3), sets the correct mode of operation. In the absense of this
+  EoL2TPv3), sets the correct mode of operation. In the absence of this
   option, the socket type is determined based on what do the src and dst
   arguments resolve/parse to.
 
@@ -574,6 +574,41 @@ please see the BESS documentation.
 https://github.com/NetSys/bess/wiki/Built-In-Modules-and-Ports
 
 BESS transport does not require any special privileges.
+
+VDE vector transport
+--------------------
+
+Virtual Distributed Ethernet (VDE) is a project whose main goal is to provide a
+highly flexible support for virtual networking.
+
+http://wiki.virtualsquare.org/#/tutorials/vdebasics
+
+Common usages of VDE include fast prototyping and teaching.
+
+Examples:
+
+   ``vecX:transport=vde,vnl=tap://tap0``
+
+use tap0
+
+   ``vecX:transport=vde,vnl=slirp://``
+
+use slirp
+
+   ``vec0:transport=vde,vnl=vde:///tmp/switch``
+
+connect to a vde switch
+
+   ``vecX:transport=\"vde,vnl=cmd://ssh remote.host //tmp/sshlirp\"``
+
+connect to a remote slirp (instant VPN: convert ssh to VPN, it uses sshlirp)
+https://github.com/virtualsquare/sshlirp
+
+   ``vec0:transport=vde,vnl=vxvde://234.0.0.1``
+
+connect to a local area cloud (all the UML nodes using the same
+multicast address running on hosts in the same multicast domain (LAN)
+will be automagically connected together to a virtual LAN.
 
 Configuring Legacy transports
 =============================
@@ -1224,7 +1259,7 @@ between a driver and the host at the UML command line is OK
 security-wise. Allowing it as a loadable module parameter
 isn't.
 
-If such functionality is desireable for a particular application
+If such functionality is desirable for a particular application
 (e.g. loading BPF "firmware" for raw socket network transports),
 it should be off by default and should be explicitly turned on
 as a command line parameter at startup.

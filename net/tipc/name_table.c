@@ -949,8 +949,8 @@ void tipc_nametbl_stop(struct net *net)
 	}
 	spin_unlock_bh(&tn->nametbl_lock);
 
-	synchronize_net();
-	kfree(nt);
+	/* TODO: clear tn->nametbl, implement proper RCU rules ? */
+	kfree_rcu(nt, rcu);
 }
 
 static int __tipc_nl_add_nametable_publ(struct tipc_nl_msg *msg,
@@ -1201,15 +1201,4 @@ void tipc_dest_list_purge(struct list_head *l)
 		list_del(&dst->list);
 		kfree(dst);
 	}
-}
-
-int tipc_dest_list_len(struct list_head *l)
-{
-	struct tipc_dest *dst;
-	int i = 0;
-
-	list_for_each_entry(dst, l, list) {
-		i++;
-	}
-	return i;
 }

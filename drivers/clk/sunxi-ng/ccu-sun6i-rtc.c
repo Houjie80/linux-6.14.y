@@ -5,8 +5,10 @@
 
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/device.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 
 #include <linux/clk/sunxi-ng.h>
@@ -241,6 +243,7 @@ static struct clk_init_data rtc_32k_init_data = {
 	.ops		= &ccu_mux_ops,
 	.parent_hws	= rtc_32k_parents,
 	.num_parents	= ARRAY_SIZE(rtc_32k_parents), /* updated during probe */
+	.flags		= CLK_IS_CRITICAL,
 };
 
 static struct ccu_mux rtc_32k_clk = {
@@ -297,10 +300,6 @@ static const struct sunxi_ccu_desc sun6i_rtc_ccu_desc = {
 	.hw_clks	= &sun6i_rtc_ccu_hw_clks,
 };
 
-static const struct clk_parent_data sun50i_h6_osc32k_fanout_parents[] = {
-	{ .hw = &osc32k_clk.common.hw },
-};
-
 static const struct clk_parent_data sun50i_h616_osc32k_fanout_parents[] = {
 	{ .hw = &osc32k_clk.common.hw },
 	{ .fw_name = "pll-32k" },
@@ -311,13 +310,6 @@ static const struct clk_parent_data sun50i_r329_osc32k_fanout_parents[] = {
 	{ .hw = &osc32k_clk.common.hw },
 	{ .hw = &ext_osc32k_gate_clk.common.hw },
 	{ .hw = &osc24M_32k_clk.common.hw }
-};
-
-static const struct sun6i_rtc_match_data sun50i_h6_rtc_ccu_data = {
-	.have_ext_osc32k	= true,
-	.have_iosc_calibration	= true,
-	.osc32k_fanout_parents	= sun50i_h6_osc32k_fanout_parents,
-	.osc32k_fanout_nparents	= ARRAY_SIZE(sun50i_h6_osc32k_fanout_parents),
 };
 
 static const struct sun6i_rtc_match_data sun50i_h616_rtc_ccu_data = {
@@ -335,10 +327,6 @@ static const struct sun6i_rtc_match_data sun50i_r329_rtc_ccu_data = {
 
 static const struct of_device_id sun6i_rtc_ccu_match[] = {
 	{
-		.compatible	= "allwinner,sun50i-h6-rtc",
-		.data		= &sun50i_h6_rtc_ccu_data,
-	},
-	{
 		.compatible	= "allwinner,sun50i-h616-rtc",
 		.data		= &sun50i_h616_rtc_ccu_data,
 	},
@@ -346,7 +334,9 @@ static const struct of_device_id sun6i_rtc_ccu_match[] = {
 		.compatible	= "allwinner,sun50i-r329-rtc",
 		.data		= &sun50i_r329_rtc_ccu_data,
 	},
+	{},
 };
+MODULE_DEVICE_TABLE(of, sun6i_rtc_ccu_match);
 
 int sun6i_rtc_ccu_probe(struct device *dev, void __iomem *reg)
 {
@@ -366,7 +356,7 @@ int sun6i_rtc_ccu_probe(struct device *dev, void __iomem *reg)
 		const char *fw_name;
 
 		/* ext-osc32k was the only input clock in the old binding. */
-		fw_name = of_property_read_bool(dev->of_node, "clock-names")
+		fw_name = of_property_present(dev->of_node, "clock-names")
 			? "ext-osc32k" : NULL;
 		ext_osc32k_clk = devm_clk_get_optional(dev, fw_name);
 		if (IS_ERR(ext_osc32k_clk))
@@ -391,5 +381,6 @@ int sun6i_rtc_ccu_probe(struct device *dev, void __iomem *reg)
 	return devm_sunxi_ccu_probe(dev, reg, &sun6i_rtc_ccu_desc);
 }
 
-MODULE_IMPORT_NS(SUNXI_CCU);
+MODULE_IMPORT_NS("SUNXI_CCU");
+MODULE_DESCRIPTION("Support for the Allwinner H616/R329 RTC CCU");
 MODULE_LICENSE("GPL");

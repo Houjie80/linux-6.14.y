@@ -187,9 +187,12 @@ static void hclge_mac_adjust_link(struct net_device *netdev)
 	speed = netdev->phydev->speed;
 	duplex = netdev->phydev->duplex;
 
-	ret = hclge_cfg_mac_speed_dup(hdev, speed, duplex);
+	ret = hclge_cfg_mac_speed_dup(hdev, speed, duplex, 0);
 	if (ret)
 		netdev_err(netdev, "failed to adjust link.\n");
+
+	hdev->hw.mac.req_speed = (u32)speed;
+	hdev->hw.mac.req_duplex = (u8)duplex;
 
 	ret = hclge_cfg_flowctrl(hdev);
 	if (ret)

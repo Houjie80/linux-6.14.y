@@ -22,30 +22,34 @@
 .macro cvdso_call funct call_time=0
   .cfi_startproc
 	PPC_STLU	r1, -PPC_MIN_STKFRM(r1)
+  .cfi_adjust_cfa_offset PPC_MIN_STKFRM
 	mflr		r0
-  .cfi_register lr, r0
 	PPC_STLU	r1, -PPC_MIN_STKFRM(r1)
+  .cfi_adjust_cfa_offset PPC_MIN_STKFRM
 	PPC_STL		r0, PPC_MIN_STKFRM + PPC_LR_STKOFF(r1)
+  .cfi_rel_offset lr, PPC_MIN_STKFRM + PPC_LR_STKOFF
 #ifdef __powerpc64__
 	PPC_STL		r2, PPC_MIN_STKFRM + STK_GOT(r1)
+  .cfi_rel_offset r2, PPC_MIN_STKFRM + STK_GOT
 #endif
-	get_datapage	r5
 	.ifeq	\call_time
-	addi		r5, r5, VDSO_DATA_OFFSET
+		get_datapage	r5 VDSO_DATA_OFFSET
 	.else
-	addi		r4, r5, VDSO_DATA_OFFSET
+		get_datapage	r4 VDSO_DATA_OFFSET
 	.endif
-	bl		DOTSYM(\funct)
+	bl		CFUNC(DOTSYM(\funct))
 	PPC_LL		r0, PPC_MIN_STKFRM + PPC_LR_STKOFF(r1)
 #ifdef __powerpc64__
 	PPC_LL		r2, PPC_MIN_STKFRM + STK_GOT(r1)
+  .cfi_restore r2
 #endif
 	.ifeq	\call_time
 	cmpwi		r3, 0
 	.endif
 	mtlr		r0
-  .cfi_restore lr
 	addi		r1, r1, 2 * PPC_MIN_STKFRM
+  .cfi_restore lr
+  .cfi_def_cfa_offset 0
 	crclr		so
 	.ifeq	\call_time
 	beqlr+
@@ -109,16 +113,3 @@ V_FUNCTION_END(__kernel_clock_getres)
 V_FUNCTION_BEGIN(__kernel_time)
 	cvdso_call __c_kernel_time call_time=1
 V_FUNCTION_END(__kernel_time)
-
-/* Routines for restoring integer registers, called by the compiler.  */
-/* Called with r11 pointing to the stack header word of the caller of the */
-/* function, just beyond the end of the integer restore area.  */
-#ifndef __powerpc64__
-_GLOBAL(_restgpr_31_x)
-_GLOBAL(_rest32gpr_31_x)
-	lwz	r0,4(r11)
-	lwz	r31,-4(r11)
-	mtlr	r0
-	mr	r1,r11
-	blr
-#endif

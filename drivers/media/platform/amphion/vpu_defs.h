@@ -69,8 +69,9 @@ enum {
 	VPU_MSG_ID_BS_ERROR,
 	VPU_MSG_ID_UNSUPPORTED,
 	VPU_MSG_ID_TIMESTAMP_INFO,
-
 	VPU_MSG_ID_FIRMWARE_XCPT,
+	VPU_MSG_ID_PIC_SKIPPED,
+	VPU_MSG_ID_DBG_MSG,
 };
 
 enum VPU_ENC_MEMORY_RESOURSE {
@@ -113,6 +114,7 @@ struct vpu_enc_pic_info {
 	u32 wptr;
 	u32 crc;
 	s64 timestamp;
+	u32 average_qp;
 };
 
 struct vpu_dec_codec_info {

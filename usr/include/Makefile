@@ -10,12 +10,12 @@ UAPI_CFLAGS := -std=c90 -Wall -Werror=implicit-function-declaration
 
 # In theory, we do not care -m32 or -m64 for header compile tests.
 # It is here just because CONFIG_CC_CAN_LINK is tested with -m32 or -m64.
-UAPI_CFLAGS += $(filter -m32 -m64 --target=%, $(KBUILD_CFLAGS))
+UAPI_CFLAGS += $(filter -m32 -m64 --target=%, $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS))
 
 # USERCFLAGS might contain sysroot location for CC.
 UAPI_CFLAGS += $(USERCFLAGS)
 
-override c_flags = $(UAPI_CFLAGS) -Wp,-MMD,$(depfile) -I$(objtree)/usr/include
+override c_flags = $(UAPI_CFLAGS) -Wp,-MMD,$(depfile) -I $(obj) -I $(srctree)/usr/dummy-include
 
 # The following are excluded for now because they fail to build.
 #
@@ -59,27 +59,11 @@ ifeq ($(SRCARCH),arc)
 no-header-test += linux/bpf_perf_event.h
 endif
 
-ifeq ($(SRCARCH),ia64)
-no-header-test += asm/setup.h
-no-header-test += asm/sigcontext.h
-no-header-test += linux/if_bonding.h
-endif
-
-ifeq ($(SRCARCH),mips)
-no-header-test += asm/stat.h
-endif
-
 ifeq ($(SRCARCH),powerpc)
-no-header-test += asm/stat.h
-no-header-test += linux/bpf_perf_event.h
-endif
-
-ifeq ($(SRCARCH),riscv)
 no-header-test += linux/bpf_perf_event.h
 endif
 
 ifeq ($(SRCARCH),sparc)
-no-header-test += asm/stat.h
 no-header-test += asm/uctx.h
 no-header-test += asm/fbio.h
 endif
@@ -92,9 +76,9 @@ always-y := $(patsubst $(obj)/%.h,%.hdrtest, $(shell find $(obj) -name '*.h' 2>/
 # Include the header twice to detect missing include guard.
 quiet_cmd_hdrtest = HDRTEST $<
       cmd_hdrtest = \
-		$(CC) $(c_flags) -S -o /dev/null -x c /dev/null \
+		$(CC) $(c_flags) -fsyntax-only -x c /dev/null \
 			$(if $(filter-out $(no-header-test), $*.h), -include $< -include $<); \
-		$(PERL) $(srctree)/$(src)/headers_check.pl $(obj) $(SRCARCH) $<; \
+		$(PERL) $(src)/headers_check.pl $(obj) $<; \
 		touch $@
 
 $(obj)/%.hdrtest: $(obj)/%.h FORCE

@@ -11,8 +11,9 @@
 /* Cookie definitions for private VCAP filters installed by the driver.
  * Must be unique per VCAP block.
  */
-#define OCELOT_VCAP_ES0_TAG_8021Q_RXVLAN(ocelot, port)		(port)
+#define OCELOT_VCAP_ES0_TAG_8021Q_RXVLAN(ocelot, port, upstream) ((upstream) << 16 | (port))
 #define OCELOT_VCAP_IS1_TAG_8021Q_TXVLAN(ocelot, port)		(port)
+#define OCELOT_VCAP_IS1_VLAN_RECLASSIFY(ocelot, port)		((ocelot)->num_phys_ports + (port))
 #define OCELOT_VCAP_IS2_TAG_8021Q_TXVLAN(ocelot, port)		(port)
 #define OCELOT_VCAP_IS2_MRP_REDIRECT(ocelot, port)		((ocelot)->num_phys_ports + (port))
 #define OCELOT_VCAP_IS2_MRP_TRAP(ocelot)			((ocelot)->num_phys_ports * 2)
@@ -499,6 +500,7 @@ struct ocelot_vcap_key_vlan {
 	struct ocelot_vcap_u8  pcp;    /* PCP (3 bit) */
 	enum ocelot_vcap_bit dei;    /* DEI */
 	enum ocelot_vcap_bit tagged; /* Tagged/untagged frame */
+	enum ocelot_vcap_bit tpid;
 };
 
 struct ocelot_vcap_key_etype {
@@ -681,7 +683,6 @@ struct ocelot_vcap_id {
 
 struct ocelot_vcap_filter {
 	struct list_head list;
-	struct list_head trap_list;
 
 	enum ocelot_vcap_filter_type type;
 	int block_id;
@@ -695,6 +696,7 @@ struct ocelot_vcap_filter {
 	struct ocelot_vcap_stats stats;
 	/* For VCAP IS1 and IS2 */
 	bool take_ts;
+	bool is_trap;
 	unsigned long ingress_port_mask;
 	/* For VCAP ES0 */
 	struct ocelot_vcap_port ingress_port;

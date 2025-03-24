@@ -226,10 +226,11 @@ aoedev_downdev(struct aoedev *d)
 	/* fast fail all pending I/O */
 	if (d->blkq) {
 		/* UP is cleared, freeze+quiesce to insure all are errored */
-		blk_mq_freeze_queue(d->blkq);
+		unsigned int memflags = blk_mq_freeze_queue(d->blkq);
+
 		blk_mq_quiesce_queue(d->blkq);
 		blk_mq_unquiesce_queue(d->blkq);
-		blk_mq_unfreeze_queue(d->blkq);
+		blk_mq_unfreeze_queue(d->blkq, memflags);
 	}
 
 	if (d->gd)
@@ -277,7 +278,7 @@ freedev(struct aoedev *d)
 	if (d->gd) {
 		aoedisk_rm_debugfs(d);
 		del_gendisk(d->gd);
-		blk_cleanup_disk(d->gd);
+		put_disk(d->gd);
 		blk_mq_free_tag_set(&d->tag_set);
 	}
 	t = d->targets;
@@ -321,7 +322,7 @@ flush(const char __user *str, size_t cnt, int exiting)
 			specified = 1;
 	}
 
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	/* pass one: do aoedev_downdev, which might sleep */
 restart1:
 	spin_lock_irqsave(&devlist_lock, flags);
@@ -520,7 +521,7 @@ freetgt(struct aoedev *d, struct aoetgt *t)
 void
 aoedev_exit(void)
 {
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	flush(NULL, 0, EXITING);
 }
 

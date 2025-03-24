@@ -37,12 +37,12 @@ struct tlc4541_state {
 	struct spi_message              scan_single_msg;
 
 	/*
-	 * DMA (thus cache coherency maintenance) requires the
+	 * DMA (thus cache coherency maintenance) may require the
 	 * transfer buffers to live in their own cache lines.
 	 * 2 bytes data + 6 bytes padding + 8 bytes timestamp when
 	 * call iio_push_to_buffers_with_timestamp.
 	 */
-	__be16                          rx_buf[8] ____cacheline_aligned;
+	__be16                          rx_buf[8] __aligned(IIO_DMA_MINALIGN);
 };
 
 struct tlc4541_chip_info {
@@ -237,14 +237,14 @@ static void tlc4541_remove(struct spi_device *spi)
 static const struct of_device_id tlc4541_dt_ids[] = {
 	{ .compatible = "ti,tlc3541", },
 	{ .compatible = "ti,tlc4541", },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(of, tlc4541_dt_ids);
 
 static const struct spi_device_id tlc4541_id[] = {
-	{"tlc3541", TLC3541},
-	{"tlc4541", TLC4541},
-	{}
+	{ "tlc3541", TLC3541 },
+	{ "tlc4541", TLC4541 },
+	{ }
 };
 MODULE_DEVICE_TABLE(spi, tlc4541_id);
 

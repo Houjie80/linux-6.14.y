@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <linux/export.h>
 #include <asm/asm-offsets.h>
 #include <asm/cache.h>
 #include <asm/code-patching-asm.h>
 #include <asm/exception-64s.h>
-#include <asm/export.h>
 #include <asm/kvm_asm.h>
 #include <asm/kvm_book3s_asm.h>
 #include <asm/mmu.h>
@@ -19,7 +19,7 @@
 
 /*
  * This is a hcall, so register convention is as
- * Documentation/powerpc/papr_hcalls.rst.
+ * Documentation/arch/powerpc/papr_hcalls.rst.
  *
  * This may also be a syscall from PR-KVM userspace that is to be
  * reflected to the PR guest kernel, so registers may be set up for
@@ -124,7 +124,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
 
 /*
  * "Skip" interrupts are part of a trick KVM uses a with hash guests to load
- * the faulting instruction in guest memory from the the hypervisor without
+ * the faulting instruction in guest memory from the hypervisor without
  * walking page tables.
  *
  * When the guest takes a fault that requires the hypervisor to load the
@@ -315,7 +315,7 @@ kvmppc_p9_exit_interrupt:
 	reg = reg + 1
 	.endr
 
-	ld	r2,PACATOC(r13)
+	LOAD_PACA_TOC()
 
 	mflr	r4
 	std	r4,VCPU_LR(r3)

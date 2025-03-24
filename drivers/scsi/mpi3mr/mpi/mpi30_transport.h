@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- *  Copyright 2016-2021 Broadcom Inc. All rights reserved.
- *
+ *  Copyright 2016-2023 Broadcom Inc. All rights reserved.
  */
 #ifndef MPI30_TRANSPORT_H
 #define MPI30_TRANSPORT_H     1
@@ -19,8 +18,8 @@ union mpi3_version_union {
 
 #define MPI3_VERSION_MAJOR                                              (3)
 #define MPI3_VERSION_MINOR                                              (0)
-#define MPI3_VERSION_UNIT                                               (23)
-#define MPI3_VERSION_DEV                                                (1)
+#define MPI3_VERSION_UNIT                                               (34)
+#define MPI3_VERSION_DEV                                                (0)
 #define MPI3_DEVHANDLE_INVALID                                          (0xffff)
 struct mpi3_sysif_oper_queue_indexes {
 	__le16         producer_index;
@@ -159,6 +158,7 @@ struct mpi3_sysif_registers {
 #define MPI3_SYSIF_FAULT_CODE_SOFT_RESET_NEEDED                         (0x0000f004)
 #define MPI3_SYSIF_FAULT_CODE_POWER_CYCLE_REQUIRED                      (0x0000f005)
 #define MPI3_SYSIF_FAULT_CODE_TEMP_THRESHOLD_EXCEEDED                   (0x0000f006)
+#define MPI3_SYSIF_FAULT_CODE_INSUFFICIENT_PCI_SLOT_POWER               (0x0000f007)
 #define MPI3_SYSIF_FAULT_INFO0_OFFSET                                   (0x00001c14)
 #define MPI3_SYSIF_FAULT_INFO1_OFFSET                                   (0x00001c18)
 #define MPI3_SYSIF_FAULT_INFO2_OFFSET                                   (0x00001c1c)
@@ -212,6 +212,7 @@ struct mpi3_default_reply_descriptor {
 #define MPI3_REPLY_DESCRIPT_FLAGS_TYPE_SUCCESS                     (0x1000)
 #define MPI3_REPLY_DESCRIPT_FLAGS_TYPE_TARGET_COMMAND_BUFFER       (0x2000)
 #define MPI3_REPLY_DESCRIPT_FLAGS_TYPE_STATUS                      (0x3000)
+#define MPI3_REPLY_DESCRIPT_REQUEST_QUEUE_ID_INVALID               (0xffff)
 struct mpi3_address_reply_descriptor {
 	__le64             reply_frame_address;
 	__le16             request_queue_ci;
@@ -410,6 +411,7 @@ struct mpi3_default_reply {
 #define MPI3_IOCSTATUS_INSUFFICIENT_RESOURCES       (0x0006)
 #define MPI3_IOCSTATUS_INVALID_FIELD                (0x0007)
 #define MPI3_IOCSTATUS_INVALID_STATE                (0x0008)
+#define MPI3_IOCSTATUS_SHUTDOWN_ACTIVE              (0x0009)
 #define MPI3_IOCSTATUS_INSUFFICIENT_POWER           (0x000a)
 #define MPI3_IOCSTATUS_INVALID_CHANGE_COUNT         (0x000b)
 #define MPI3_IOCSTATUS_ALLOWED_CMD_BLOCK            (0x000c)

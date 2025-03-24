@@ -15,7 +15,7 @@
  * abstraction builds upon this BAR interface.
  */
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kref.h>
@@ -537,11 +537,13 @@ static int enable_bars(struct nfp6000_pcie *nfp, u16 interface)
 	const u32 barcfg_msix_general =
 		NFP_PCIE_BAR_PCIE2CPP_MapType(
 			NFP_PCIE_BAR_PCIE2CPP_MapType_GENERAL) |
-		NFP_PCIE_BAR_PCIE2CPP_LengthSelect_32BIT;
+		NFP_PCIE_BAR_PCIE2CPP_LengthSelect(
+			NFP_PCIE_BAR_PCIE2CPP_LengthSelect_32BIT);
 	const u32 barcfg_msix_xpb =
 		NFP_PCIE_BAR_PCIE2CPP_MapType(
 			NFP_PCIE_BAR_PCIE2CPP_MapType_BULK) |
-		NFP_PCIE_BAR_PCIE2CPP_LengthSelect_32BIT |
+		NFP_PCIE_BAR_PCIE2CPP_LengthSelect(
+			NFP_PCIE_BAR_PCIE2CPP_LengthSelect_32BIT) |
 		NFP_PCIE_BAR_PCIE2CPP_Target_BaseAddress(
 			NFP_CPP_TARGET_ISLAND_XPB);
 	const u32 barcfg_explicit[4] = {
@@ -621,13 +623,13 @@ static int enable_bars(struct nfp6000_pcie *nfp, u16 interface)
 			nfp->dev_info->pcie_expl_offset;
 
 		switch (nfp->pdev->device) {
-		case PCI_DEVICE_ID_NETRONOME_NFP3800:
+		case PCI_DEVICE_ID_NFP3800:
 			pf = nfp->pdev->devfn & 7;
 			nfp->iomem.csr = bar->iomem + NFP_PCIE_BAR(pf);
 			break;
-		case PCI_DEVICE_ID_NETRONOME_NFP4000:
-		case PCI_DEVICE_ID_NETRONOME_NFP5000:
-		case PCI_DEVICE_ID_NETRONOME_NFP6000:
+		case PCI_DEVICE_ID_NFP4000:
+		case PCI_DEVICE_ID_NFP5000:
+		case PCI_DEVICE_ID_NFP6000:
 			nfp->iomem.csr = bar->iomem + NFP_PCIE_BAR(0);
 			break;
 		default:
@@ -640,12 +642,12 @@ static int enable_bars(struct nfp6000_pcie *nfp, u16 interface)
 	}
 
 	switch (nfp->pdev->device) {
-	case PCI_DEVICE_ID_NETRONOME_NFP3800:
+	case PCI_DEVICE_ID_NFP3800:
 		expl_groups = 1;
 		break;
-	case PCI_DEVICE_ID_NETRONOME_NFP4000:
-	case PCI_DEVICE_ID_NETRONOME_NFP5000:
-	case PCI_DEVICE_ID_NETRONOME_NFP6000:
+	case PCI_DEVICE_ID_NFP4000:
+	case PCI_DEVICE_ID_NFP5000:
+	case PCI_DEVICE_ID_NFP6000:
 		expl_groups = 4;
 		break;
 	default:
@@ -1314,7 +1316,7 @@ nfp_cpp_from_nfp6000_pcie(struct pci_dev *pdev, const struct nfp_dev_info *dev_i
 	int err;
 
 	/*  Finished with card initialization. */
-	dev_info(&pdev->dev, "Netronome Flow Processor %s PCIe Card Probe\n",
+	dev_info(&pdev->dev, "Network Flow Processor %s PCIe Card Probe\n",
 		 dev_info->chip_names);
 	pcie_print_link_status(pdev);
 

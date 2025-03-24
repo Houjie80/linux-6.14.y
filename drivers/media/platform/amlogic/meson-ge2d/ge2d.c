@@ -391,8 +391,6 @@ static const struct vb2_ops ge2d_qops = {
 	.buf_queue = ge2d_buf_queue,
 	.start_streaming = ge2d_start_streaming,
 	.stop_streaming = ge2d_stop_streaming,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
 };
 
 static int
@@ -1024,17 +1022,14 @@ disable_clks:
 	return ret;
 }
 
-static int ge2d_remove(struct platform_device *pdev)
+static void ge2d_remove(struct platform_device *pdev)
 {
 	struct meson_ge2d *ge2d = platform_get_drvdata(pdev);
 
 	video_unregister_device(ge2d->vfd);
 	v4l2_m2m_release(ge2d->m2m_dev);
-	video_device_release(ge2d->vfd);
 	v4l2_device_unregister(&ge2d->v4l2_dev);
 	clk_disable_unprepare(ge2d->clk);
-
-	return 0;
 }
 
 static const struct of_device_id meson_ge2d_match[] = {

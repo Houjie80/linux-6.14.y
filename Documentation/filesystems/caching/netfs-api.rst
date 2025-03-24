@@ -59,7 +59,7 @@ A filesystem would typically have a volume cookie for each superblock.
 
 The filesystem then acquires a cookie for each file within that volume using an
 object key.  Object keys are binary blobs and only need to be unique within
-their parent volume.  The cache backend is reponsible for rendering the binary
+their parent volume.  The cache backend is responsible for rendering the binary
 blob into something it can use and may employ hash tables, trees or whatever to
 improve its ability to find an object.  This is transparent to the network
 filesystem.
@@ -91,7 +91,7 @@ actually required and it can use the fscache I/O API directly.
 Volume Registration
 ===================
 
-The first step for a network filsystem is to acquire a volume cookie for the
+The first step for a network filesystem is to acquire a volume cookie for the
 volume it wants to access::
 
 	struct fscache_volume *
@@ -119,7 +119,7 @@ is provided.  If the coherency data doesn't match, the entire cache volume will
 be invalidated.
 
 This function can return errors such as EBUSY if the volume key is already in
-use by an acquired volume or ENOMEM if an allocation failure occured.  It may
+use by an acquired volume or ENOMEM if an allocation failure occurred.  It may
 also return a NULL volume cookie if fscache is not enabled.  It is safe to
 pass a NULL cookie to any function that takes a volume cookie.  This will
 cause that function to do nothing.
@@ -433,11 +433,11 @@ has done a write and then the page it wrote from has been released by the VM,
 after which it *has* to look in the cache.
 
 To inform fscache that a page might now be in the cache, the following function
-should be called from the ``releasepage`` address space op::
+should be called from the ``release_folio`` address space op::
 
 	void fscache_note_page_release(struct fscache_cookie *cookie);
 
-if the page has been released (ie. releasepage returned true).
+if the page has been released (ie. release_folio returned true).
 
 Page release and page invalidation should also wait for any mark left on the
 page to say that a DIO write is underway from that page::

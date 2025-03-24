@@ -149,10 +149,8 @@ static void iguanair_rx(struct urb *urb)
 		return;
 
 	ir = urb->context;
-	if (!ir) {
-		usb_unlink_urb(urb);
+	if (!ir)
 		return;
-	}
 
 	switch (urb->status) {
 	case 0:
@@ -161,7 +159,6 @@ static void iguanair_rx(struct urb *urb)
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
-		usb_unlink_urb(urb);
 		return;
 	case -EPIPE:
 	default:
@@ -197,8 +194,10 @@ static int iguanair_send(struct iguanair *ir, unsigned size)
 	if (rc)
 		return rc;
 
-	if (wait_for_completion_timeout(&ir->completion, TIMEOUT) == 0)
+	if (wait_for_completion_timeout(&ir->completion, TIMEOUT) == 0) {
+		usb_kill_urb(ir->urb_out);
 		return -ETIMEDOUT;
+	}
 
 	return rc;
 }

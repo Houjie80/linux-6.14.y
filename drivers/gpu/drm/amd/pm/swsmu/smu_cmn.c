@@ -37,32 +37,9 @@
 #undef pr_info
 #undef pr_debug
 
-/*
- * Although these are defined in each ASIC's specific header file.
- * They share the same definitions and values. That makes common
- * APIs for SMC messages issuing for all ASICs possible.
- */
-#define mmMP1_SMN_C2PMSG_66                                                                            0x0282
-#define mmMP1_SMN_C2PMSG_66_BASE_IDX                                                                   0
-
-#define mmMP1_SMN_C2PMSG_82                                                                            0x0292
-#define mmMP1_SMN_C2PMSG_82_BASE_IDX                                                                   0
-
-#define mmMP1_SMN_C2PMSG_90                                                                            0x029a
-#define mmMP1_SMN_C2PMSG_90_BASE_IDX                                                                   0
-
-/* SMU 13.0.5 has its specific mailbox messaging registers */
-
-#define mmMP1_C2PMSG_2                                                                            (0xbee142 + 0xb00000 / 4)
-#define mmMP1_C2PMSG_2_BASE_IDX                                                                   0
-
-#define mmMP1_C2PMSG_34                                                                           (0xbee262 + 0xb00000 / 4)
-#define mmMP1_C2PMSG_34_BASE_IDX                                                                   0
-
-#define mmMP1_C2PMSG_33                                                                                (0xbee261 + 0xb00000 / 4)
-#define mmMP1_C2PMSG_33_BASE_IDX                                                                   0
-
 #define MP1_C2PMSG_90__CONTENT_MASK                                                                    0xFFFFFFFFL
+
+const int link_speed[] = {25, 50, 80, 160, 320, 640};
 
 #undef __SMU_DUMMY_MAP
 #define __SMU_DUMMY_MAP(type)	#type
@@ -79,7 +56,7 @@ static const char * const __smu_message_names[] = {
 static const char *smu_get_message_name(struct smu_context *smu,
 					enum smu_message_type type)
 {
-	if (type < 0 || type >= SMU_MSG_MAX_COUNT)
+	if (type >= SMU_MSG_MAX_COUNT)
 		return "unknown smu message";
 
 	return __smu_message_names[type];
@@ -90,10 +67,7 @@ static void smu_cmn_read_arg(struct smu_context *smu,
 {
 	struct amdgpu_device *adev = smu->adev;
 
-	if (adev->ip_versions[MP1_HWIP][0] == IP_VERSION(13, 0, 5))
-		*arg = RREG32_SOC15(MP1, 0, mmMP1_C2PMSG_34);
-	else
-		*arg = RREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_82);
+	*arg = RREG32(smu->param_reg);
 }
 
 /* Redefine the SMU error codes here.
@@ -139,10 +113,7 @@ static u32 __smu_cmn_poll_stat(struct smu_context *smu)
 	u32 reg;
 
 	for ( ; timeout > 0; timeout--) {
-		if (adev->ip_versions[MP1_HWIP][0] == IP_VERSION(13, 0, 5))
-			reg = RREG32_SOC15(MP1, 0, mmMP1_C2PMSG_33);
-		else
-			reg = RREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_90);
+		reg = RREG32(smu->resp_reg);
 		if ((reg & MP1_C2PMSG_90__CONTENT_MASK) != 0)
 			break;
 
@@ -164,13 +135,8 @@ static void __smu_cmn_reg_print_error(struct smu_context *smu,
 
 	switch (reg_c2pmsg_90) {
 	case SMU_RESP_NONE: {
-		if (adev->ip_versions[MP1_HWIP][0] == IP_VERSION(13, 0, 5)) {
-			msg_idx = RREG32_SOC15(MP1, 0, mmMP1_C2PMSG_2);
-			prm     = RREG32_SOC15(MP1, 0, mmMP1_C2PMSG_34);
-		} else {
-			msg_idx = RREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_66);
-			prm     = RREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_82);
-		}
+		msg_idx = RREG32(smu->msg_reg);
+		prm     = RREG32(smu->param_reg);
 		dev_err_ratelimited(adev->dev,
 				    "SMU: I'm not done with your previous command: SMN_C2PMSG_66:0x%08X SMN_C2PMSG_82:0x%08X",
 				    msg_idx, prm);
@@ -264,18 +230,67 @@ static void __smu_cmn_send_msg(struct smu_context *smu,
 {
 	struct amdgpu_device *adev = smu->adev;
 
-	if (adev->ip_versions[MP1_HWIP][0] == IP_VERSION(13, 0, 5)) {
-		WREG32_SOC15(MP1, 0, mmMP1_C2PMSG_33, 0);
-		WREG32_SOC15(MP1, 0, mmMP1_C2PMSG_34, param);
-		WREG32_SOC15(MP1, 0, mmMP1_C2PMSG_2, msg);
-	} else {
-		WREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_90, 0);
-		WREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_82, param);
-		WREG32_SOC15(MP1, 0, mmMP1_SMN_C2PMSG_66, msg);
-	}
-
+	WREG32(smu->resp_reg, 0);
+	WREG32(smu->param_reg, param);
+	WREG32(smu->msg_reg, msg);
 }
 
+static inline uint32_t __smu_cmn_get_msg_flags(struct smu_context *smu,
+					       enum smu_message_type msg)
+{
+	return smu->message_map[msg].flags;
+}
+
+static int __smu_cmn_ras_filter_msg(struct smu_context *smu,
+				    enum smu_message_type msg, bool *poll)
+{
+	struct amdgpu_device *adev = smu->adev;
+	uint32_t flags, resp;
+	bool fed_status;
+
+	flags = __smu_cmn_get_msg_flags(smu, msg);
+	*poll = true;
+
+	/* When there is RAS fatal error, FW won't process non-RAS priority
+	 * messages. Don't allow any messages other than RAS priority messages.
+	 */
+	fed_status = amdgpu_ras_get_fed_status(adev);
+	if (fed_status) {
+		if (!(flags & SMU_MSG_RAS_PRI)) {
+			dev_dbg(adev->dev,
+				"RAS error detected, skip sending %s",
+				smu_get_message_name(smu, msg));
+			return -EACCES;
+		}
+
+		/* FW will ignore non-priority messages when a RAS fatal error
+		 * is detected. Hence it is possible that a previous message
+		 * wouldn't have got response. Allow to continue without polling
+		 * for response status for priority messages.
+		 */
+		resp = RREG32(smu->resp_reg);
+		dev_dbg(adev->dev,
+			"Sending RAS priority message %s response status: %x",
+			smu_get_message_name(smu, msg), resp);
+		if (resp == 0)
+			*poll = false;
+	}
+
+	return 0;
+}
+
+static int __smu_cmn_send_debug_msg(struct smu_context *smu,
+			       u32 msg,
+			       u32 param)
+{
+	struct amdgpu_device *adev = smu->adev;
+
+	WREG32(smu->debug_param_reg, param);
+	WREG32(smu->debug_msg_reg, msg);
+	WREG32(smu->debug_resp_reg, 0);
+
+	return 0;
+}
 /**
  * smu_cmn_send_msg_without_waiting -- send the message; don't wait for status
  * @smu: pointer to an SMU context
@@ -300,11 +315,21 @@ int smu_cmn_send_msg_without_waiting(struct smu_context *smu,
 	if (adev->no_hw_access)
 		return 0;
 
-	reg = __smu_cmn_poll_stat(smu);
-	res = __smu_cmn_reg2errno(smu, reg);
-	if (reg == SMU_RESP_NONE ||
-	    res == -EREMOTEIO)
+	if (smu->smc_fw_state == SMU_FW_HANG) {
+		dev_err(adev->dev, "SMU is in hanged state, failed to send smu message!\n");
+		res = -EREMOTEIO;
 		goto Out;
+	}
+
+	if (smu->smc_fw_state == SMU_FW_INIT) {
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+	} else {
+		reg = __smu_cmn_poll_stat(smu);
+		res = __smu_cmn_reg2errno(smu, reg);
+		if (reg == SMU_RESP_NONE || res == -EREMOTEIO)
+			goto Out;
+	}
+
 	__smu_cmn_send_msg(smu, msg_index, param);
 	res = 0;
 Out:
@@ -335,6 +360,9 @@ int smu_cmn_wait_for_response(struct smu_context *smu)
 	reg = __smu_cmn_poll_stat(smu);
 	res = __smu_cmn_reg2errno(smu, reg);
 
+	if (res == -EREMOTEIO)
+		smu->smc_fw_state = SMU_FW_HANG;
+
 	if (unlikely(smu->adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) &&
 	    res && (res != -ETIME)) {
 		amdgpu_device_halt(smu->adev);
@@ -356,9 +384,11 @@ int smu_cmn_wait_for_response(struct smu_context *smu)
  * completion of the command, and return back a value from the SMU in
  * @read_arg pointer.
  *
- * Return 0 on success, -errno on error, if we weren't able to send
- * the message or if the message completed with some kind of
- * error. See __smu_cmn_reg2errno() for details of the -errno.
+ * Return 0 on success, -errno when a problem is encountered sending
+ * message or receiving reply. If there is a PCI bus recovery or
+ * the destination is a virtual GPU which does not allow this message
+ * type, the message is simply dropped and success is also returned.
+ * See __smu_cmn_reg2errno() for details of the -errno.
  *
  * If we weren't able to send the message to the SMU, we also print
  * the error to the standard log.
@@ -381,6 +411,7 @@ int smu_cmn_send_smc_msg_with_param(struct smu_context *smu,
 {
 	struct amdgpu_device *adev = smu->adev;
 	int res, index;
+	bool poll = true;
 	u32 reg;
 
 	if (adev->no_hw_access)
@@ -393,20 +424,48 @@ int smu_cmn_send_smc_msg_with_param(struct smu_context *smu,
 		return index == -EACCES ? 0 : index;
 
 	mutex_lock(&smu->message_lock);
-	reg = __smu_cmn_poll_stat(smu);
-	res = __smu_cmn_reg2errno(smu, reg);
-	if (reg == SMU_RESP_NONE ||
-	    res == -EREMOTEIO) {
-		__smu_cmn_reg_print_error(smu, reg, index, param, msg);
+
+	if (smu->smc_fw_caps & SMU_FW_CAP_RAS_PRI) {
+		res = __smu_cmn_ras_filter_msg(smu, msg, &poll);
+		if (res)
+			goto Out;
+	}
+
+	if (smu->smc_fw_state == SMU_FW_HANG) {
+		dev_err(adev->dev, "SMU is in hanged state, failed to send smu message!\n");
+		res = -EREMOTEIO;
 		goto Out;
+	} else if (smu->smc_fw_state == SMU_FW_INIT) {
+		/* Ignore initial smu response register value */
+		poll = false;
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+	}
+
+	if (poll) {
+		reg = __smu_cmn_poll_stat(smu);
+		res = __smu_cmn_reg2errno(smu, reg);
+		if (reg == SMU_RESP_NONE || res == -EREMOTEIO) {
+			__smu_cmn_reg_print_error(smu, reg, index, param, msg);
+			goto Out;
+		}
 	}
 	__smu_cmn_send_msg(smu, (uint16_t) index, param);
 	reg = __smu_cmn_poll_stat(smu);
 	res = __smu_cmn_reg2errno(smu, reg);
-	if (res != 0)
+	if (res != 0) {
+		if (res == -EREMOTEIO)
+			smu->smc_fw_state = SMU_FW_HANG;
 		__smu_cmn_reg_print_error(smu, reg, index, param, msg);
-	if (read_arg)
+	}
+	if (read_arg) {
 		smu_cmn_read_arg(smu, read_arg);
+		dev_dbg(adev->dev, "smu send message: %s(%d) param: 0x%08x, resp: 0x%08x,\
+			readval: 0x%08x\n",
+			smu_get_message_name(smu, msg), index, param, reg, *read_arg);
+	} else {
+		dev_dbg(adev->dev, "smu send message: %s(%d) param: 0x%08x, resp: 0x%08x\n",
+			smu_get_message_name(smu, msg), index, param, reg);
+	}
 Out:
 	if (unlikely(adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) && res) {
 		amdgpu_device_halt(adev);
@@ -427,6 +486,18 @@ int smu_cmn_send_smc_msg(struct smu_context *smu,
 					       read_arg);
 }
 
+int smu_cmn_send_debug_smc_msg(struct smu_context *smu,
+			 uint32_t msg)
+{
+	return __smu_cmn_send_debug_msg(smu, msg, 0);
+}
+
+int smu_cmn_send_debug_smc_msg_with_param(struct smu_context *smu,
+			 uint32_t msg, uint32_t param)
+{
+	return __smu_cmn_send_debug_msg(smu, msg, param);
+}
+
 int smu_cmn_to_asic_specific_index(struct smu_context *smu,
 				   enum smu_cmn2asic_mapping_type type,
 				   uint32_t index)
@@ -445,7 +516,7 @@ int smu_cmn_to_asic_specific_index(struct smu_context *smu,
 			return -EINVAL;
 
 		if (amdgpu_sriov_vf(smu->adev) &&
-		    !msg_mapping.valid_in_vf)
+		    !(msg_mapping.flags & SMU_MSG_VF_FLAG))
 			return -EACCES;
 
 		return msg_mapping.map_to;
@@ -495,13 +566,13 @@ int smu_cmn_to_asic_specific_index(struct smu_context *smu,
 		return mapping.map_to;
 
 	case CMN2ASIC_MAPPING_WORKLOAD:
-		if (index > PP_SMC_POWER_PROFILE_CUSTOM ||
+		if (index >= PP_SMC_POWER_PROFILE_COUNT ||
 		    !smu->workload_map)
 			return -EINVAL;
 
 		mapping = smu->workload_map[index];
 		if (!mapping.valid_mapping)
-			return -EINVAL;
+			return -ENOTSUPP;
 
 		return mapping.map_to;
 
@@ -578,6 +649,17 @@ bool smu_cmn_clk_dpm_is_enabled(struct smu_context *smu,
 		break;
 	case SMU_SOCCLK:
 		feature_id = SMU_FEATURE_DPM_SOCCLK_BIT;
+		break;
+	case SMU_VCLK:
+	case SMU_VCLK1:
+		feature_id = SMU_FEATURE_DPM_VCLK_BIT;
+		break;
+	case SMU_DCLK:
+	case SMU_DCLK1:
+		feature_id = SMU_FEATURE_DPM_DCLK_BIT;
+		break;
+	case SMU_FCLK:
+		feature_id = SMU_FEATURE_DPM_FCLK_BIT;
 		break;
 	default:
 		return true;
@@ -697,14 +779,14 @@ int smu_cmn_feature_set_enabled(struct smu_context *smu,
 
 #undef __SMU_DUMMY_MAP
 #define __SMU_DUMMY_MAP(fea)	#fea
-static const char* __smu_feature_names[] = {
+static const char *__smu_feature_names[] = {
 	SMU_FEATURE_MASKS
 };
 
 static const char *smu_get_feature_name(struct smu_context *smu,
 					enum smu_feature_mask feature)
 {
-	if (feature < 0 || feature >= SMU_FEATURE_COUNT)
+	if (feature >= SMU_FEATURE_COUNT)
 		return "unknown smu feature";
 	return __smu_feature_names[feature];
 }
@@ -712,16 +794,13 @@ static const char *smu_get_feature_name(struct smu_context *smu,
 size_t smu_cmn_get_pp_feature_mask(struct smu_context *smu,
 				   char *buf)
 {
+	int8_t sort_feature[MAX(SMU_FEATURE_COUNT, SMU_FEATURE_MAX)];
 	uint64_t feature_mask;
-	int feature_index = 0;
+	int i, feature_index;
 	uint32_t count = 0;
-	int8_t sort_feature[SMU_FEATURE_COUNT];
 	size_t size = 0;
-	int ret = 0, i;
-	int feature_id;
 
-	ret = __smu_get_enabled_features(smu, &feature_mask);
-	if (ret)
+	if (__smu_get_enabled_features(smu, &feature_mask))
 		return 0;
 
 	size =  sysfs_emit_at(buf, size, "features high: 0x%08x low: 0x%08x\n",
@@ -742,22 +821,15 @@ size_t smu_cmn_get_pp_feature_mask(struct smu_context *smu,
 	size += sysfs_emit_at(buf, size, "%-2s. %-20s  %-3s : %-s\n",
 			"No", "Feature", "Bit", "State");
 
-	for (i = 0; i < SMU_FEATURE_COUNT; i++) {
-		if (sort_feature[i] < 0)
-			continue;
-
-		/* convert to asic spcific feature ID */
-		feature_id = smu_cmn_to_asic_specific_index(smu,
-							    CMN2ASIC_MAPPING_FEATURE,
-							    sort_feature[i]);
-		if (feature_id < 0)
+	for (feature_index = 0; feature_index < SMU_FEATURE_MAX; feature_index++) {
+		if (sort_feature[feature_index] < 0)
 			continue;
 
 		size += sysfs_emit_at(buf, size, "%02d. %-20s (%2d) : %s\n",
 				count++,
-				smu_get_feature_name(smu, sort_feature[i]),
-				i,
-				!!test_bit(feature_id, (unsigned long *)&feature_mask) ?
+				smu_get_feature_name(smu, sort_feature[feature_index]),
+				feature_index,
+				!!test_bit(feature_index, (unsigned long *)&feature_mask) ?
 				"enabled" : "disabled");
 	}
 
@@ -943,7 +1015,7 @@ int smu_cmn_get_metrics_table(struct smu_context *smu,
 			      void *metrics_table,
 			      bool bypass_cache)
 {
-	struct smu_table_context *smu_table= &smu->smu_table;
+	struct smu_table_context *smu_table = &smu->smu_table;
 	uint32_t table_size =
 		smu_table->tables[SMU_TABLE_SMU_METRICS].size;
 	int ret = 0;
@@ -969,12 +1041,23 @@ int smu_cmn_get_metrics_table(struct smu_context *smu,
 	return 0;
 }
 
+int smu_cmn_get_combo_pptable(struct smu_context *smu)
+{
+	void *pptable = smu->smu_table.combo_pptable;
+
+	return smu_cmn_update_table(smu,
+				    SMU_TABLE_COMBO_PPTABLE,
+				    0,
+				    pptable,
+				    false);
+}
+
 void smu_cmn_init_soft_gpu_metrics(void *table, uint8_t frev, uint8_t crev)
 {
 	struct metrics_table_header *header = (struct metrics_table_header *)table;
 	uint16_t structure_size;
 
-#define METRICS_VERSION(a, b)	((a << 16) | b )
+#define METRICS_VERSION(a, b)	((a << 16) | b)
 
 	switch (METRICS_VERSION(frev, crev)) {
 	case METRICS_VERSION(1, 0):
@@ -989,6 +1072,18 @@ void smu_cmn_init_soft_gpu_metrics(void *table, uint8_t frev, uint8_t crev)
 	case METRICS_VERSION(1, 3):
 		structure_size = sizeof(struct gpu_metrics_v1_3);
 		break;
+	case METRICS_VERSION(1, 4):
+		structure_size = sizeof(struct gpu_metrics_v1_4);
+		break;
+	case METRICS_VERSION(1, 5):
+		structure_size = sizeof(struct gpu_metrics_v1_5);
+		break;
+	case METRICS_VERSION(1, 6):
+		structure_size = sizeof(struct gpu_metrics_v1_6);
+		break;
+	case METRICS_VERSION(1, 7):
+		structure_size = sizeof(struct gpu_metrics_v1_7);
+		break;
 	case METRICS_VERSION(2, 0):
 		structure_size = sizeof(struct gpu_metrics_v2_0);
 		break;
@@ -997,6 +1092,15 @@ void smu_cmn_init_soft_gpu_metrics(void *table, uint8_t frev, uint8_t crev)
 		break;
 	case METRICS_VERSION(2, 2):
 		structure_size = sizeof(struct gpu_metrics_v2_2);
+		break;
+	case METRICS_VERSION(2, 3):
+		structure_size = sizeof(struct gpu_metrics_v2_3);
+		break;
+	case METRICS_VERSION(2, 4):
+		structure_size = sizeof(struct gpu_metrics_v2_4);
+		break;
+	case METRICS_VERSION(3, 0):
+		structure_size = sizeof(struct gpu_metrics_v3_0);
 		break;
 	default:
 		return;
@@ -1059,4 +1163,86 @@ bool smu_cmn_is_audio_func_enabled(struct amdgpu_device *adev)
 	pci_dev_put(p);
 
 	return snd_driver_loaded;
+}
+
+static char *smu_soc_policy_get_desc(struct smu_dpm_policy *policy, int level)
+{
+	if (level < 0 || !(policy->level_mask & BIT(level)))
+		return "Invalid";
+
+	switch (level) {
+	case SOC_PSTATE_DEFAULT:
+		return "soc_pstate_default";
+	case SOC_PSTATE_0:
+		return "soc_pstate_0";
+	case SOC_PSTATE_1:
+		return "soc_pstate_1";
+	case SOC_PSTATE_2:
+		return "soc_pstate_2";
+	}
+
+	return "Invalid";
+}
+
+static struct smu_dpm_policy_desc pstate_policy_desc = {
+	.name = STR_SOC_PSTATE_POLICY,
+	.get_desc = smu_soc_policy_get_desc,
+};
+
+void smu_cmn_generic_soc_policy_desc(struct smu_dpm_policy *policy)
+{
+	policy->desc = &pstate_policy_desc;
+}
+
+static char *smu_xgmi_plpd_policy_get_desc(struct smu_dpm_policy *policy,
+					   int level)
+{
+	if (level < 0 || !(policy->level_mask & BIT(level)))
+		return "Invalid";
+
+	switch (level) {
+	case XGMI_PLPD_DISALLOW:
+		return "plpd_disallow";
+	case XGMI_PLPD_DEFAULT:
+		return "plpd_default";
+	case XGMI_PLPD_OPTIMIZED:
+		return "plpd_optimized";
+	}
+
+	return "Invalid";
+}
+
+static struct smu_dpm_policy_desc xgmi_plpd_policy_desc = {
+	.name = STR_XGMI_PLPD_POLICY,
+	.get_desc = smu_xgmi_plpd_policy_get_desc,
+};
+
+void smu_cmn_generic_plpd_policy_desc(struct smu_dpm_policy *policy)
+{
+	policy->desc = &xgmi_plpd_policy_desc;
+}
+
+void smu_cmn_get_backend_workload_mask(struct smu_context *smu,
+				       u32 workload_mask,
+				       u32 *backend_workload_mask)
+{
+	int workload_type;
+	u32 profile_mode;
+
+	*backend_workload_mask = 0;
+
+	for (profile_mode = 0; profile_mode < PP_SMC_POWER_PROFILE_COUNT; profile_mode++) {
+		if (!(workload_mask & (1 << profile_mode)))
+			continue;
+
+		/* conv PP_SMC_POWER_PROFILE* to WORKLOAD_PPLIB_*_BIT */
+		workload_type = smu_cmn_to_asic_specific_index(smu,
+							       CMN2ASIC_MAPPING_WORKLOAD,
+							       profile_mode);
+
+		if (workload_type < 0)
+			continue;
+
+		*backend_workload_mask |= 1 << workload_type;
+	}
 }

@@ -276,8 +276,6 @@ static const struct vb2_ops gsc_m2m_qops = {
 	.queue_setup	 = gsc_m2m_queue_setup,
 	.buf_prepare	 = gsc_m2m_buf_prepare,
 	.buf_queue	 = gsc_m2m_buf_queue,
-	.wait_prepare	 = vb2_ops_wait_prepare,
-	.wait_finish	 = vb2_ops_wait_finish,
 	.stop_streaming	 = gsc_m2m_stop_streaming,
 	.start_streaming = gsc_m2m_start_streaming,
 };
@@ -285,13 +283,8 @@ static const struct vb2_ops gsc_m2m_qops = {
 static int gsc_m2m_querycap(struct file *file, void *fh,
 			   struct v4l2_capability *cap)
 {
-	struct gsc_ctx *ctx = fh_to_ctx(fh);
-	struct gsc_dev *gsc = ctx->gsc_dev;
-
 	strscpy(cap->driver, GSC_MODULE_NAME, sizeof(cap->driver));
 	strscpy(cap->card, GSC_MODULE_NAME " gscaler", sizeof(cap->card));
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
-		 dev_name(&gsc->pdev->dev));
 	return 0;
 }
 

@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Realtek switches for unmanaged switches
 
 allOf:
-  - $ref: dsa.yaml#
+  - $ref: dsa.yaml#/$defs/ethernet-ports
 
 maintainers:
   - Linus Walleij <linus.walleij@linaro.org>
@@ -27,32 +27,25 @@ description:
   The realtek-mdio driver is an MDIO driver and it must be inserted inside
   an MDIO node.
 
+  The compatible string is only used to identify which (silicon) family the
+  switch belongs to. Roughly speaking, a family is any set of Realtek switches
+  whose chip identification register(s) have a common location and semantics.
+  The different models in a given family can be automatically disambiguated by
+  parsing the chip identification register(s) according to the given family,
+  avoiding the need for a unique compatible string for each model.
+
 properties:
   compatible:
     enum:
       - realtek,rtl8365mb
-      - realtek,rtl8366
       - realtek,rtl8366rb
-      - realtek,rtl8366s
-      - realtek,rtl8367
-      - realtek,rtl8367b
-      - realtek,rtl8367rb
-      - realtek,rtl8367s
-      - realtek,rtl8368s
-      - realtek,rtl8369
-      - realtek,rtl8370
     description: |
-      realtek,rtl8365mb: 4+1 ports
-      realtek,rtl8366: 5+1 ports
-      realtek,rtl8366rb: 5+1 ports
-      realtek,rtl8366s: 5+1 ports
-      realtek,rtl8367:
-      realtek,rtl8367b:
-      realtek,rtl8367rb: 5+2 ports
-      realtek,rtl8367s: 5+2 ports
-      realtek,rtl8368s: 8 ports
-      realtek,rtl8369: 8+1 ports
-      realtek,rtl8370: 8+2 ports
+      realtek,rtl8365mb:
+        Use with models RTL8363NB, RTL8363NB-VB, RTL8363SC, RTL8363SC-VB,
+        RTL8364NB, RTL8364NB-VB, RTL8365MB, RTL8366SC, RTL8367RB-VB, RTL8367S,
+        RTL8367SB, RTL8370MB, RTL8310SR
+      realtek,rtl8366rb:
+        Use with models RTL8366RB, RTL8366S
 
   mdc-gpios:
     description: GPIO line for the MDC clock line.
@@ -66,6 +59,9 @@ properties:
     description: GPIO to be used to reset the whole device
     maxItems: 1
 
+  resets:
+    maxItems: 1
+
   realtek,disable-leds:
     type: boolean
     description: |
@@ -75,6 +71,8 @@ properties:
 
   interrupt-controller:
     type: object
+    additionalProperties: false
+
     description: |
       This defines an interrupt controller with an IRQ line (typically
       a GPIO) that will demultiplex and handle the interrupt from the single
@@ -115,6 +113,7 @@ if:
     - reg
 
 then:
+  $ref: /schemas/spi/spi-peripheral-props.yaml#
   not:
     required:
       - mdc-gpios
@@ -131,7 +130,6 @@ else:
     - mdc-gpios
     - mdio-gpios
     - mdio
-    - reset-gpios
 
 required:
   - compatible
@@ -149,7 +147,7 @@ examples:
     #include <dt-bindings/interrupt-controller/irq.h>
 
     platform {
-            switch {
+            ethernet-switch {
                     compatible = "realtek,rtl8366rb";
                     /* 22 = MDIO (has input reads), 21 = MDC (clock, output only) */
                     mdc-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
@@ -165,37 +163,36 @@ examples:
                             #interrupt-cells = <1>;
                     };
 
-                    ports {
+                    ethernet-ports {
                             #address-cells = <1>;
                             #size-cells = <0>;
-                            port@0 {
+                            ethernet-port@0 {
                                     reg = <0>;
                                     label = "lan0";
                                     phy-handle = <&phy0>;
                             };
-                            port@1 {
+                            ethernet-port@1 {
                                     reg = <1>;
                                     label = "lan1";
                                     phy-handle = <&phy1>;
                             };
-                            port@2 {
+                            ethernet-port@2 {
                                     reg = <2>;
                                     label = "lan2";
                                     phy-handle = <&phy2>;
                             };
-                            port@3 {
+                            ethernet-port@3 {
                                     reg = <3>;
                                     label = "lan3";
                                     phy-handle = <&phy3>;
                             };
-                            port@4 {
+                            ethernet-port@4 {
                                     reg = <4>;
                                     label = "wan";
                                     phy-handle = <&phy4>;
                             };
-                            port@5 {
+                            ethernet-port@5 {
                                     reg = <5>;
-                                    label = "cpu";
                                     ethernet = <&gmac0>;
                                     phy-mode = "rgmii";
                                     fixed-link {
@@ -244,7 +241,7 @@ examples:
     #include <dt-bindings/interrupt-controller/irq.h>
 
     platform {
-            switch {
+            ethernet-switch {
                     compatible = "realtek,rtl8365mb";
                     mdc-gpios = <&gpio1 16 GPIO_ACTIVE_HIGH>;
                     mdio-gpios = <&gpio1 17 GPIO_ACTIVE_HIGH>;
@@ -258,32 +255,31 @@ examples:
                             #interrupt-cells = <1>;
                     };
 
-                    ports {
+                    ethernet-ports {
                             #address-cells = <1>;
                             #size-cells = <0>;
-                            port@0 {
+                            ethernet-port@0 {
                                     reg = <0>;
                                     label = "swp0";
                                     phy-handle = <&ethphy0>;
                             };
-                            port@1 {
+                            ethernet-port@1 {
                                     reg = <1>;
                                     label = "swp1";
                                     phy-handle = <&ethphy1>;
                             };
-                            port@2 {
+                            ethernet-port@2 {
                                     reg = <2>;
                                     label = "swp2";
                                     phy-handle = <&ethphy2>;
                             };
-                            port@3 {
+                            ethernet-port@3 {
                                     reg = <3>;
                                     label = "swp3";
                                     phy-handle = <&ethphy3>;
                             };
-                            port@6 {
+                            ethernet-port@6 {
                                     reg = <6>;
-                                    label = "cpu";
                                     ethernet = <&fec1>;
                                     phy-mode = "rgmii";
                                     tx-internal-delay-ps = <2000>;
@@ -334,8 +330,8 @@ examples:
             #address-cells = <1>;
             #size-cells = <0>;
 
-            switch@29 {
-                    compatible = "realtek,rtl8367s";
+            ethernet-switch@29 {
+                    compatible = "realtek,rtl8365mb";
                     reg = <29>;
 
                     reset-gpios = <&gpio2 20 GPIO_ACTIVE_LOW>;
@@ -348,36 +344,36 @@ examples:
                             #interrupt-cells = <1>;
                     };
 
-                    ports {
+                    ethernet-ports {
                             #address-cells = <1>;
                             #size-cells = <0>;
 
-                            port@0 {
+                            ethernet-port@0 {
                                     reg = <0>;
                                     label = "lan4";
                             };
 
-                            port@1 {
+                            ethernet-port@1 {
                                     reg = <1>;
                                     label = "lan3";
                             };
 
-                            port@2 {
+                            ethernet-port@2 {
                                     reg = <2>;
                                     label = "lan2";
                             };
 
-                            port@3 {
+                            ethernet-port@3 {
                                     reg = <3>;
                                     label = "lan1";
                             };
 
-                            port@4 {
+                            ethernet-port@4 {
                                     reg = <4>;
                                     label = "wan";
                             };
 
-                            port@7 {
+                            ethernet-port@7 {
                                     reg = <7>;
                                     ethernet = <&ethernet>;
                                     phy-mode = "rgmii";

@@ -43,8 +43,13 @@ properties:
       - const: phy_clk
       - const: ref_clk
 
+  power-domains:
+    maxItems: 1
+
   reg:
     maxItems: 1
+
+  dma-coherent: true
 
 required:
   - compatible

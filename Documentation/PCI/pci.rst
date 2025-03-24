@@ -52,7 +52,7 @@ driver generally needs to perform the following initialization:
   - Enable DMA/processing engines
 
 When done using the device, and perhaps the module needs to be unloaded,
-the driver needs to take the follow steps:
+the driver needs to take the following steps:
 
   - Disable the device from generating IRQs
   - Release the IRQ (free_irq())
@@ -273,12 +273,12 @@ Set the DMA mask size
 While all drivers should explicitly indicate the DMA capability
 (e.g. 32 or 64 bit) of the PCI bus master, devices with more than
 32-bit bus master capability for streaming data need the driver
-to "register" this capability by calling pci_set_dma_mask() with
+to "register" this capability by calling dma_set_mask() with
 appropriate parameters.  In general this allows more efficient DMA
 on systems where System RAM exists above 4G _physical_ address.
 
 Drivers for all PCI-X and PCIe compliant devices must call
-set_dma_mask() as they are 64-bit DMA devices.
+dma_set_mask() as they are 64-bit DMA devices.
 
 Similarly, drivers must also "register" this capability if the device
 can directly address "coherent memory" in System RAM above 4G physical
@@ -335,7 +335,7 @@ causes the PCI support to program CPU vector data into the PCI device
 capability registers. Many architectures, chip-sets, or BIOSes do NOT
 support MSI or MSI-X and a call to pci_alloc_irq_vectors with just
 the PCI_IRQ_MSI and PCI_IRQ_MSIX flags will fail, so try to always
-specify PCI_IRQ_LEGACY as well.
+specify PCI_IRQ_INTX as well.
 
 Drivers that have different interrupt handlers for MSI/MSI-X and
 legacy INTx should chose the right one based on the msi_enabled

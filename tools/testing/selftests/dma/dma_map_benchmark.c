@@ -10,8 +10,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <linux/map_benchmark.h>
 #include <linux/types.h>
+#include <linux/map_benchmark.h>
 
 #define NSEC_PER_MSEC	1000000L
 
@@ -33,7 +33,6 @@ int main(int argc, char **argv)
 	int granule = 1;
 
 	int cmd = DMA_MAP_BENCHMARK;
-	char *p;
 
 	while ((opt = getopt(argc, argv, "t:s:n:b:d:x:g:")) != -1) {
 		switch (opt) {

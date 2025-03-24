@@ -20,7 +20,7 @@
  * if it fits in a aligned 'long'. The caller needs to check
  * the return value against "> max".
  */
-static inline long do_strnlen_user(const char __user *src, unsigned long count, unsigned long max)
+static __always_inline long do_strnlen_user(const char __user *src, unsigned long count, unsigned long max)
 {
 	const struct word_at_a_time constants = WORD_AT_A_TIME_CONSTANTS;
 	unsigned long align, res = 0;
@@ -95,6 +95,15 @@ long strnlen_user(const char __user *str, long count)
 
 	if (unlikely(count <= 0))
 		return 0;
+
+	if (can_do_masked_user_access()) {
+		long retval;
+
+		str = masked_user_access_begin(str);
+		retval = do_strnlen_user(str, count, count);
+		user_read_access_end();
+		return retval;
+	}
 
 	max_addr = TASK_SIZE_MAX;
 	src_addr = (unsigned long)untagged_addr(str);

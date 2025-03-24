@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
+// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
 /* Copyright (c) 2015 - 2021 Intel Corporation */
 #include "main.h"
 
@@ -258,18 +258,16 @@ int irdma_net_event(struct notifier_block *notifier, unsigned long event,
 	u32 local_ipaddr[4] = {};
 	bool ipv4 = true;
 
-	real_dev = rdma_vlan_dev_real_dev(netdev);
-	if (!real_dev)
-		real_dev = netdev;
-
-	ibdev = ib_device_get_by_netdev(real_dev, RDMA_DRIVER_IRDMA);
-	if (!ibdev)
-		return NOTIFY_DONE;
-
-	iwdev = to_iwdev(ibdev);
-
 	switch (event) {
 	case NETEVENT_NEIGH_UPDATE:
+		real_dev = rdma_vlan_dev_real_dev(netdev);
+		if (!real_dev)
+			real_dev = netdev;
+		ibdev = ib_device_get_by_netdev(real_dev, RDMA_DRIVER_IRDMA);
+		if (!ibdev)
+			return NOTIFY_DONE;
+
+		iwdev = to_iwdev(ibdev);
 		p = (__be32 *)neigh->primary_key;
 		if (neigh->tbl->family == AF_INET6) {
 			ipv4 = false;
@@ -290,12 +288,11 @@ int irdma_net_event(struct notifier_block *notifier, unsigned long event,
 			irdma_manage_arp_cache(iwdev->rf, neigh->ha,
 					       local_ipaddr, ipv4,
 					       IRDMA_ARP_DELETE);
+		ib_device_put(ibdev);
 		break;
 	default:
 		break;
 	}
-
-	ib_device_put(ibdev);
 
 	return NOTIFY_DONE;
 }
@@ -323,9 +320,6 @@ int irdma_netdevice_event(struct notifier_block *notifier, unsigned long event,
 	case NETDEV_DOWN:
 		iwdev->iw_status = 0;
 		fallthrough;
-	case NETDEV_UP:
-		irdma_port_ibevent(iwdev);
-		break;
 	default:
 		break;
 	}
@@ -484,7 +478,7 @@ void irdma_free_cqp_request(struct irdma_cqp *cqp,
 	if (cqp_request->dynamic) {
 		kfree(cqp_request);
 	} else {
-		cqp_request->request_done = false;
+		WRITE_ONCE(cqp_request->request_done, false);
 		cqp_request->callback_fcn = NULL;
 		cqp_request->waiting = false;
 
@@ -518,7 +512,7 @@ irdma_free_pending_cqp_request(struct irdma_cqp *cqp,
 {
 	if (cqp_request->waiting) {
 		cqp_request->compl_info.error = true;
-		cqp_request->request_done = true;
+		WRITE_ONCE(cqp_request->request_done, true);
 		wake_up(&cqp_request->waitq);
 	}
 	wait_event_timeout(cqp->remove_wq,
@@ -570,11 +564,11 @@ static int irdma_wait_event(struct irdma_pci_f *rf,
 	bool cqp_error = false;
 	int err_code = 0;
 
-	cqp_timeout.compl_cqp_cmds = rf->sc_dev.cqp_cmd_stats[IRDMA_OP_CMPL_CMDS];
+	cqp_timeout.compl_cqp_cmds = atomic64_read(&rf->sc_dev.cqp->completed_ops);
 	do {
 		irdma_cqp_ce_handler(rf, &rf->ccq.sc_cq);
 		if (wait_event_timeout(cqp_request->waitq,
-				       cqp_request->request_done,
+				       READ_ONCE(cqp_request->request_done),
 				       msecs_to_jiffies(CQP_COMPL_WAIT_TIME_MS)))
 			break;
 
@@ -593,11 +587,14 @@ static int irdma_wait_event(struct irdma_pci_f *rf,
 	cqp_error = cqp_request->compl_info.error;
 	if (cqp_error) {
 		err_code = -EIO;
-		if (cqp_request->compl_info.maj_err_code == 0xFFFF &&
-		    cqp_request->compl_info.min_err_code == 0x8029) {
-			if (!rf->reset) {
-				rf->reset = true;
-				rf->gen_ops.request_reset(rf);
+		if (cqp_request->compl_info.maj_err_code == 0xFFFF) {
+			if (cqp_request->compl_info.min_err_code == 0x8002)
+				err_code = -EBUSY;
+			else if (cqp_request->compl_info.min_err_code == 0x8029) {
+				if (!rf->reset) {
+					rf->reset = true;
+					rf->gen_ops.request_reset(rf);
+				}
 			}
 		}
 	}
@@ -655,6 +652,7 @@ static const char *const irdma_cqp_cmd_names[IRDMA_MAX_CQP_OPS] = {
 };
 
 static const struct irdma_cqp_err_info irdma_noncrit_err_list[] = {
+	{0xffff, 0x8002, "Invalid State"},
 	{0xffff, 0x8006, "Flush No Wqe Pending"},
 	{0xffff, 0x8007, "Modify QP Bad Close"},
 	{0xffff, 0x8009, "LLP Closed"},
@@ -757,6 +755,31 @@ void irdma_qp_rem_ref(struct ib_qp *ibqp)
 	iwdev->rf->qp_table[qp_num] = NULL;
 	spin_unlock_irqrestore(&iwdev->rf->qptable_lock, flags);
 	complete(&iwqp->free_qp);
+}
+
+void irdma_cq_add_ref(struct ib_cq *ibcq)
+{
+	struct irdma_cq *iwcq = to_iwcq(ibcq);
+
+	refcount_inc(&iwcq->refcnt);
+}
+
+void irdma_cq_rem_ref(struct ib_cq *ibcq)
+{
+	struct ib_device *ibdev = ibcq->device;
+	struct irdma_device *iwdev = to_iwdev(ibdev);
+	struct irdma_cq *iwcq = to_iwcq(ibcq);
+	unsigned long flags;
+
+	spin_lock_irqsave(&iwdev->rf->cqtable_lock, flags);
+	if (!refcount_dec_and_test(&iwcq->refcnt)) {
+		spin_unlock_irqrestore(&iwdev->rf->cqtable_lock, flags);
+		return;
+	}
+
+	iwdev->rf->cq_table[iwcq->cq_num] = NULL;
+	spin_unlock_irqrestore(&iwdev->rf->cqtable_lock, flags);
+	complete(&iwcq->free_cq);
 }
 
 struct ib_device *to_ibdev(struct irdma_sc_dev *dev)
@@ -943,74 +966,6 @@ void irdma_terminate_del_timer(struct irdma_sc_qp *qp)
 	ret = del_timer(&iwqp->terminate_timer);
 	if (ret)
 		irdma_qp_rem_ref(&iwqp->ibqp);
-}
-
-/**
- * irdma_cqp_query_fpm_val_cmd - send cqp command for fpm
- * @dev: function device struct
- * @val_mem: buffer for fpm
- * @hmc_fn_id: function id for fpm
- */
-int irdma_cqp_query_fpm_val_cmd(struct irdma_sc_dev *dev,
-				struct irdma_dma_mem *val_mem, u8 hmc_fn_id)
-{
-	struct irdma_cqp_request *cqp_request;
-	struct cqp_cmds_info *cqp_info;
-	struct irdma_pci_f *rf = dev_to_rf(dev);
-	int status;
-
-	cqp_request = irdma_alloc_and_get_cqp_request(&rf->cqp, true);
-	if (!cqp_request)
-		return -ENOMEM;
-
-	cqp_info = &cqp_request->info;
-	cqp_request->param = NULL;
-	cqp_info->in.u.query_fpm_val.cqp = dev->cqp;
-	cqp_info->in.u.query_fpm_val.fpm_val_pa = val_mem->pa;
-	cqp_info->in.u.query_fpm_val.fpm_val_va = val_mem->va;
-	cqp_info->in.u.query_fpm_val.hmc_fn_id = hmc_fn_id;
-	cqp_info->cqp_cmd = IRDMA_OP_QUERY_FPM_VAL;
-	cqp_info->post_sq = 1;
-	cqp_info->in.u.query_fpm_val.scratch = (uintptr_t)cqp_request;
-
-	status = irdma_handle_cqp_op(rf, cqp_request);
-	irdma_put_cqp_request(&rf->cqp, cqp_request);
-
-	return status;
-}
-
-/**
- * irdma_cqp_commit_fpm_val_cmd - commit fpm values in hw
- * @dev: hardware control device structure
- * @val_mem: buffer with fpm values
- * @hmc_fn_id: function id for fpm
- */
-int irdma_cqp_commit_fpm_val_cmd(struct irdma_sc_dev *dev,
-				 struct irdma_dma_mem *val_mem, u8 hmc_fn_id)
-{
-	struct irdma_cqp_request *cqp_request;
-	struct cqp_cmds_info *cqp_info;
-	struct irdma_pci_f *rf = dev_to_rf(dev);
-	int status;
-
-	cqp_request = irdma_alloc_and_get_cqp_request(&rf->cqp, true);
-	if (!cqp_request)
-		return -ENOMEM;
-
-	cqp_info = &cqp_request->info;
-	cqp_request->param = NULL;
-	cqp_info->in.u.commit_fpm_val.cqp = dev->cqp;
-	cqp_info->in.u.commit_fpm_val.fpm_val_pa = val_mem->pa;
-	cqp_info->in.u.commit_fpm_val.fpm_val_va = val_mem->va;
-	cqp_info->in.u.commit_fpm_val.hmc_fn_id = hmc_fn_id;
-	cqp_info->cqp_cmd = IRDMA_OP_COMMIT_FPM_VAL;
-	cqp_info->post_sq = 1;
-	cqp_info->in.u.commit_fpm_val.scratch = (uintptr_t)cqp_request;
-
-	status = irdma_handle_cqp_op(rf, cqp_request);
-	irdma_put_cqp_request(&rf->cqp, cqp_request);
-
-	return status;
 }
 
 /**
@@ -1367,17 +1322,12 @@ int irdma_ieq_check_mpacrc(struct shash_desc *desc, void *addr, u32 len,
 			   u32 val)
 {
 	u32 crc = 0;
-	int ret;
-	int ret_code = 0;
 
-	crypto_shash_init(desc);
-	ret = crypto_shash_update(desc, addr, len);
-	if (!ret)
-		crypto_shash_final(desc, (u8 *)&crc);
+	crypto_shash_digest(desc, addr, len, (u8 *)&crc);
 	if (crc != val)
-		ret_code = -EINVAL;
+		return -EINVAL;
 
-	return ret_code;
+	return 0;
 }
 
 /**
@@ -1633,10 +1583,10 @@ static void irdma_hw_stats_timeout(struct timer_list *t)
 		from_timer(pf_devstat, t, stats_timer);
 	struct irdma_sc_vsi *sc_vsi = pf_devstat->vsi;
 
-	if (sc_vsi->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_1)
-		irdma_cqp_gather_stats_gen1(sc_vsi->dev, sc_vsi->pestat);
-	else
+	if (sc_vsi->dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2)
 		irdma_cqp_gather_stats_cmd(sc_vsi->dev, sc_vsi->pestat, false);
+	else
+		irdma_cqp_gather_stats_gen1(sc_vsi->dev, sc_vsi->pestat);
 
 	mod_timer(&pf_devstat->stats_timer,
 		  jiffies + msecs_to_jiffies(STATS_TIMER_DELAY));
@@ -1685,164 +1635,28 @@ void irdma_cqp_gather_stats_gen1(struct irdma_sc_dev *dev,
 {
 	struct irdma_gather_stats *gather_stats =
 		pestat->gather_info.gather_stats_va;
+	const struct irdma_hw_stat_map *map = dev->hw_stats_map;
+	u16 max_stats_idx = dev->hw_attrs.max_stat_idx;
 	u32 stats_inst_offset_32;
 	u32 stats_inst_offset_64;
+	u64 new_val;
+	u16 i;
 
 	stats_inst_offset_32 = (pestat->gather_info.use_stats_inst) ?
-				       pestat->gather_info.stats_inst_index :
-				       pestat->hw->hmc.hmc_fn_id;
+				pestat->gather_info.stats_inst_index :
+				pestat->hw->hmc.hmc_fn_id;
 	stats_inst_offset_32 *= 4;
 	stats_inst_offset_64 = stats_inst_offset_32 * 2;
 
-	gather_stats->rxvlanerr =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_RXVLANERR]
-		     + stats_inst_offset_32);
-	gather_stats->ip4rxdiscard =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP4RXDISCARD]
-		     + stats_inst_offset_32);
-	gather_stats->ip4rxtrunc =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP4RXTRUNC]
-		     + stats_inst_offset_32);
-	gather_stats->ip4txnoroute =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP4TXNOROUTE]
-		     + stats_inst_offset_32);
-	gather_stats->ip6rxdiscard =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP6RXDISCARD]
-		     + stats_inst_offset_32);
-	gather_stats->ip6rxtrunc =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP6RXTRUNC]
-		     + stats_inst_offset_32);
-	gather_stats->ip6txnoroute =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_IP6TXNOROUTE]
-		     + stats_inst_offset_32);
-	gather_stats->tcprtxseg =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_TCPRTXSEG]
-		     + stats_inst_offset_32);
-	gather_stats->tcprxopterr =
-		rd32(dev->hw,
-		     dev->hw_stats_regs_32[IRDMA_HW_STAT_INDEX_TCPRXOPTERR]
-		     + stats_inst_offset_32);
-
-	gather_stats->ip4rxocts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4RXOCTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4rxpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4RXPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4txfrag =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4RXFRAGS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4rxmcpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4RXMCPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4txocts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4TXOCTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4txpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4TXPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4txfrag =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4TXFRAGS]
-		     + stats_inst_offset_64);
-	gather_stats->ip4txmcpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP4TXMCPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6rxocts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6RXOCTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6rxpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6RXPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6txfrags =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6RXFRAGS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6rxmcpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6RXMCPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6txocts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6TXOCTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6txpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6TXPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6txfrags =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6TXFRAGS]
-		     + stats_inst_offset_64);
-	gather_stats->ip6txmcpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_IP6TXMCPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->tcprxsegs =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_TCPRXSEGS]
-		     + stats_inst_offset_64);
-	gather_stats->tcptxsegs =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_TCPTXSEG]
-		     + stats_inst_offset_64);
-	gather_stats->rdmarxrds =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMARXRDS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmarxsnds =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMARXSNDS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmarxwrs =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMARXWRS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmatxrds =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMATXRDS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmatxsnds =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMATXSNDS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmatxwrs =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMATXWRS]
-		     + stats_inst_offset_64);
-	gather_stats->rdmavbn =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMAVBND]
-		     + stats_inst_offset_64);
-	gather_stats->rdmavinv =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_RDMAVINV]
-		     + stats_inst_offset_64);
-	gather_stats->udprxpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_UDPRXPKTS]
-		     + stats_inst_offset_64);
-	gather_stats->udptxpkts =
-		rd64(dev->hw,
-		     dev->hw_stats_regs_64[IRDMA_HW_STAT_INDEX_UDPTXPKTS]
-		     + stats_inst_offset_64);
+	for (i = 0; i < max_stats_idx; i++) {
+		if (map[i].bitmask <= IRDMA_MAX_STATS_32)
+			new_val = rd32(dev->hw,
+				       dev->hw_stats_regs[i] + stats_inst_offset_32);
+		else
+			new_val = rd64(dev->hw,
+				       dev->hw_stats_regs[i] + stats_inst_offset_64);
+		gather_stats->val[map[i].byteoff / sizeof(u64)] = new_val;
+	}
 
 	irdma_process_stats(pestat);
 }
@@ -2478,6 +2292,9 @@ void irdma_ib_qp_event(struct irdma_qp *iwqp, enum irdma_qp_event_type event)
 	case IRDMA_QP_EVENT_ACCESS_ERR:
 		ibevent.event = IB_EVENT_QP_ACCESS_ERR;
 		break;
+	case IRDMA_QP_EVENT_REQ_ERR:
+		ibevent.event = IB_EVENT_QP_REQ_ERR;
+		break;
 	}
 	ibevent.device = iwqp->ibqp.device;
 	ibevent.element.qp = &iwqp->ibqp;
@@ -2497,4 +2314,156 @@ bool irdma_cq_empty(struct irdma_cq *iwcq)
 	polarity = (u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
 
 	return polarity != ukcq->polarity;
+}
+
+void irdma_remove_cmpls_list(struct irdma_cq *iwcq)
+{
+	struct irdma_cmpl_gen *cmpl_node;
+	struct list_head *tmp_node, *list_node;
+
+	list_for_each_safe (list_node, tmp_node, &iwcq->cmpl_generated) {
+		cmpl_node = list_entry(list_node, struct irdma_cmpl_gen, list);
+		list_del(&cmpl_node->list);
+		kfree(cmpl_node);
+	}
+}
+
+int irdma_generated_cmpls(struct irdma_cq *iwcq, struct irdma_cq_poll_info *cq_poll_info)
+{
+	struct irdma_cmpl_gen *cmpl;
+
+	if (list_empty(&iwcq->cmpl_generated))
+		return -ENOENT;
+	cmpl = list_first_entry_or_null(&iwcq->cmpl_generated, struct irdma_cmpl_gen, list);
+	list_del(&cmpl->list);
+	memcpy(cq_poll_info, &cmpl->cpi, sizeof(*cq_poll_info));
+	kfree(cmpl);
+
+	ibdev_dbg(iwcq->ibcq.device,
+		  "VERBS: %s: Poll artificially generated completion for QP 0x%X, op %u, wr_id=0x%llx\n",
+		  __func__, cq_poll_info->qp_id, cq_poll_info->op_type,
+		  cq_poll_info->wr_id);
+
+	return 0;
+}
+
+/**
+ * irdma_set_cpi_common_values - fill in values for polling info struct
+ * @cpi: resulting structure of cq_poll_info type
+ * @qp: QPair
+ * @qp_num: id of the QP
+ */
+static void irdma_set_cpi_common_values(struct irdma_cq_poll_info *cpi,
+					struct irdma_qp_uk *qp, u32 qp_num)
+{
+	cpi->comp_status = IRDMA_COMPL_STATUS_FLUSHED;
+	cpi->error = true;
+	cpi->major_err = IRDMA_FLUSH_MAJOR_ERR;
+	cpi->minor_err = FLUSH_GENERAL_ERR;
+	cpi->qp_handle = (irdma_qp_handle)(uintptr_t)qp;
+	cpi->qp_id = qp_num;
+}
+
+static inline void irdma_comp_handler(struct irdma_cq *cq)
+{
+	if (!cq->ibcq.comp_handler)
+		return;
+	if (atomic_cmpxchg(&cq->armed, 1, 0))
+		cq->ibcq.comp_handler(&cq->ibcq, cq->ibcq.cq_context);
+}
+
+void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+{
+	struct irdma_qp_uk *qp = &iwqp->sc_qp.qp_uk;
+	struct irdma_ring *sq_ring = &qp->sq_ring;
+	struct irdma_ring *rq_ring = &qp->rq_ring;
+	struct irdma_cmpl_gen *cmpl;
+	__le64 *sw_wqe;
+	u64 wqe_qword;
+	u32 wqe_idx;
+	bool compl_generated = false;
+	unsigned long flags1;
+
+	spin_lock_irqsave(&iwqp->iwscq->lock, flags1);
+	if (irdma_cq_empty(iwqp->iwscq)) {
+		unsigned long flags2;
+
+		spin_lock_irqsave(&iwqp->lock, flags2);
+		while (IRDMA_RING_MORE_WORK(*sq_ring)) {
+			cmpl = kzalloc(sizeof(*cmpl), GFP_ATOMIC);
+			if (!cmpl) {
+				spin_unlock_irqrestore(&iwqp->lock, flags2);
+				spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
+				return;
+			}
+
+			wqe_idx = sq_ring->tail;
+			irdma_set_cpi_common_values(&cmpl->cpi, qp, qp->qp_id);
+
+			cmpl->cpi.wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
+			sw_wqe = qp->sq_base[wqe_idx].elem;
+			get_64bit_val(sw_wqe, 24, &wqe_qword);
+			cmpl->cpi.op_type = (u8)FIELD_GET(IRDMAQPSQ_OPCODE, IRDMAQPSQ_OPCODE);
+			cmpl->cpi.q_type = IRDMA_CQE_QTYPE_SQ;
+			/* remove the SQ WR by moving SQ tail*/
+			IRDMA_RING_SET_TAIL(*sq_ring,
+				sq_ring->tail + qp->sq_wrtrk_array[sq_ring->tail].quanta);
+			if (cmpl->cpi.op_type == IRDMAQP_OP_NOP) {
+				kfree(cmpl);
+				continue;
+			}
+			ibdev_dbg(iwqp->iwscq->ibcq.device,
+				  "DEV: %s: adding wr_id = 0x%llx SQ Completion to list qp_id=%d\n",
+				  __func__, cmpl->cpi.wr_id, qp->qp_id);
+			list_add_tail(&cmpl->list, &iwqp->iwscq->cmpl_generated);
+			compl_generated = true;
+		}
+		spin_unlock_irqrestore(&iwqp->lock, flags2);
+		spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
+		if (compl_generated)
+			irdma_comp_handler(iwqp->iwscq);
+	} else {
+		spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
+		mod_delayed_work(iwqp->iwdev->cleanup_wq, &iwqp->dwork_flush,
+				 msecs_to_jiffies(IRDMA_FLUSH_DELAY_MS));
+	}
+
+	spin_lock_irqsave(&iwqp->iwrcq->lock, flags1);
+	if (irdma_cq_empty(iwqp->iwrcq)) {
+		unsigned long flags2;
+
+		spin_lock_irqsave(&iwqp->lock, flags2);
+		while (IRDMA_RING_MORE_WORK(*rq_ring)) {
+			cmpl = kzalloc(sizeof(*cmpl), GFP_ATOMIC);
+			if (!cmpl) {
+				spin_unlock_irqrestore(&iwqp->lock, flags2);
+				spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
+				return;
+			}
+
+			wqe_idx = rq_ring->tail;
+			irdma_set_cpi_common_values(&cmpl->cpi, qp, qp->qp_id);
+
+			cmpl->cpi.wr_id = qp->rq_wrid_array[wqe_idx];
+			cmpl->cpi.op_type = IRDMA_OP_TYPE_REC;
+			cmpl->cpi.q_type = IRDMA_CQE_QTYPE_RQ;
+			/* remove the RQ WR by moving RQ tail */
+			IRDMA_RING_SET_TAIL(*rq_ring, rq_ring->tail + 1);
+			ibdev_dbg(iwqp->iwrcq->ibcq.device,
+				  "DEV: %s: adding wr_id = 0x%llx RQ Completion to list qp_id=%d, wqe_idx=%d\n",
+				  __func__, cmpl->cpi.wr_id, qp->qp_id,
+				  wqe_idx);
+			list_add_tail(&cmpl->list, &iwqp->iwrcq->cmpl_generated);
+
+			compl_generated = true;
+		}
+		spin_unlock_irqrestore(&iwqp->lock, flags2);
+		spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
+		if (compl_generated)
+			irdma_comp_handler(iwqp->iwrcq);
+	} else {
+		spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
+		mod_delayed_work(iwqp->iwdev->cleanup_wq, &iwqp->dwork_flush,
+				 msecs_to_jiffies(IRDMA_FLUSH_DELAY_MS));
+	}
 }

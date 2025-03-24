@@ -32,18 +32,28 @@ DECLARE_PER_CPU(u32, kstack_offset);
 #endif
 
 /*
- * Use, at most, 10 bits of entropy. We explicitly cap this to keep the
- * "VLA" from being unbounded (see above). 10 bits leaves enough room for
- * per-arch offset masks to reduce entropy (by removing higher bits, since
- * high entropy may overly constrain usable stack space), and for
- * compiler/arch-specific stack alignment to remove the lower bits.
+ * Use, at most, 6 bits of entropy (on 64-bit; 8 on 32-bit). This cap is
+ * to keep the "VLA" from being unbounded (see above). Additionally clear
+ * the bottom 4 bits (on 64-bit systems, 2 for 32-bit), since stack
+ * alignment will always be at least word size. This makes the compiler
+ * code gen better when it is applying the actual per-arch alignment to
+ * the final offset. The resulting randomness is reasonable without overly
+ * constraining usable stack space.
  */
-#define KSTACK_OFFSET_MAX(x)	((x) & 0x3FF)
+#ifdef CONFIG_64BIT
+#define KSTACK_OFFSET_MAX(x)	((x) & 0b1111110000)
+#else
+#define KSTACK_OFFSET_MAX(x)	((x) & 0b1111111100)
+#endif
 
-/*
- * These macros must be used during syscall entry when interrupts and
+/**
+ * add_random_kstack_offset - Increase stack utilization by previously
+ *			      chosen random offset
+ *
+ * This should be used in the syscall entry path when interrupts and
  * preempt are disabled, and after user registers have been stored to
- * the stack.
+ * the stack. For testing the resulting entropy, please see:
+ * tools/testing/selftests/lkdtm/stack-entropy.sh
  */
 #define add_random_kstack_offset() do {					\
 	if (static_branch_maybe(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,	\
@@ -55,11 +65,28 @@ DECLARE_PER_CPU(u32, kstack_offset);
 	}								\
 } while (0)
 
+/**
+ * choose_random_kstack_offset - Choose the random offset for the next
+ *				 add_random_kstack_offset()
+ *
+ * This should only be used during syscall exit when interrupts and
+ * preempt are disabled. This position in the syscall flow is done to
+ * frustrate attacks from userspace attempting to learn the next offset:
+ * - Maximize the timing uncertainty visible from userspace: if the
+ *   offset is chosen at syscall entry, userspace has much more control
+ *   over the timing between choosing offsets. "How long will we be in
+ *   kernel mode?" tends to be more difficult to predict than "how long
+ *   will we be in user mode?"
+ * - Reduce the lifetime of the new offset sitting in memory during
+ *   kernel mode execution. Exposure of "thread-local" memory content
+ *   (e.g. current, percpu, etc) tends to be easier than arbitrary
+ *   location memory exposure.
+ */
 #define choose_random_kstack_offset(rand) do {				\
 	if (static_branch_maybe(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,	\
 				&randomize_kstack_offset)) {		\
 		u32 offset = raw_cpu_read(kstack_offset);		\
-		offset ^= (rand);					\
+		offset = ror32(offset, 5) ^ (rand);			\
 		raw_cpu_write(kstack_offset, offset);			\
 	}								\
 } while (0)
