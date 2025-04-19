@@ -16,6 +16,7 @@ properties:
   compatible:
     enum:
       - amlogic,meson-g12a-periphs-pinctrl
+      - amlogic,meson-sc2-periphs-pinctrl
 
 required:
   - compatible
