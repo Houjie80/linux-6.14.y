@@ -23,6 +23,7 @@ properties:
       - items:
           - const: amlogic,meson-gx-mmc
           - const: amlogic,meson-gxbb-mmc
+          - const: amlogic,meson-s4-mmc
 
   reg:
     maxItems: 1
