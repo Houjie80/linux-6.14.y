@@ -41,7 +41,6 @@ properties:
           - const: amlogic,meson-g12a-uart
           - const: amlogic,meson-gx-uart
           - const: amlogic,meson-ao-uart
-          - const: amlogic,meson-gxl-uart
       - description: Everything-Else power domain UART controller
         enum:
           - amlogic,meson6-uart
