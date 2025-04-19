@@ -590,7 +590,8 @@ const struct clk_ops meson_secure_clk_pll_ops = {
 	.enable		= meson_secure_clk_pll_enable,
 	.disable	= meson_secure_clk_pll_disable
 };
-EXPORT_SYMBOL_GPL(meson_secure_clk_pll_ops);
+EXPORT_SYMBOL_NS_GPL(meson_clk_pll_ro_ops, CLK_MESON);
+
 MODULE_DESCRIPTION("Amlogic PLL driver");
 MODULE_AUTHOR("Carlo Caione <carlo@endlessm.com>");
 MODULE_AUTHOR("Jerome Brunet <jbrunet@baylibre.com>");
