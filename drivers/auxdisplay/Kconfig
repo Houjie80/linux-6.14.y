@@ -58,6 +58,7 @@ config LCD2S
 	  from Modtronix engineering as a console output device. The display
 	  is a simple single color character display. You have to connect it
 	  to an I2C bus.
+
 config FD6551
 	tristate "FD6551 driver for LED 7 segment displays"
 	depends on I2C_GPIO
