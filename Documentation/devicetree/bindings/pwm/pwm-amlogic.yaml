@@ -21,6 +21,7 @@ properties:
           - amlogic,meson-g12a-ee-pwm
           - amlogic,meson-g12a-ao-pwm-ab
           - amlogic,meson-g12a-ao-pwm-cd
+          - amlogic,meson-s4-pwm
         deprecated: true
       - items:
           - const: amlogic,meson-gx-pwm
