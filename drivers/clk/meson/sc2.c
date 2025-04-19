@@ -20,6 +20,7 @@
 #include "clk-cpu-dyndiv.h"
 #include "vid-pll-div.h"
 #include "clk-dualdiv.h"
+#include "meson-clkc-utils.h"
 #include "sc2.h"
 #include <dt-bindings/clock/amlogic,sc2-clkc.h>
 
