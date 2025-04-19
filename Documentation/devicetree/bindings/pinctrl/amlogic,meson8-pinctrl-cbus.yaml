@@ -21,6 +21,7 @@ properties:
           - amlogic,meson-gxbb-periphs-pinctrl
           - amlogic,meson-gxl-periphs-pinctrl
           - amlogic,meson-axg-periphs-pinctrl
+          - amlogic,meson-sc2-periphs-pinctrl
       - items:
           - const: amlogic,meson8m2-cbus-pinctrl
           - const: amlogic,meson8-cbus-pinctrl
