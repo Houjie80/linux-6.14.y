@@ -115,11 +115,21 @@ static int mpll_set_rate(struct clk_hw *hw,
 
 	params_from_rate(rate, parent_rate, &sdm, &n2, mpll->flags);
 
+	if (mpll->lock)
+		spin_lock_irqsave(mpll->lock, flags);
+	else
+		__acquire(mpll->lock);
+
 	/* Set the fractional part */
 	meson_parm_write(clk->map, &mpll->sdm, sdm);
 
 	/* Set the integer divider part */
 	meson_parm_write(clk->map, &mpll->n2, n2);
+
+	if (mpll->lock)
+		spin_unlock_irqrestore(mpll->lock, flags);
+	else
+		__release(mpll->lock);
 
 	return 0;
 }
