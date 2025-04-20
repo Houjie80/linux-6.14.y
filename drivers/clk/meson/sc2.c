@@ -24,8 +24,6 @@
 #include "sc2.h"
 #include <dt-bindings/clock/amlogic,sc2-clkc.h>
 
-static DEFINE_SPINLOCK(meson_clk_lock);
-
 static struct clk_regmap sc2_fixed_pll_dco = {
 	.data = &(struct meson_clk_pll_data){
 		.en = {
