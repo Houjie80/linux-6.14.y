@@ -451,10 +451,12 @@ static int meson_mmc_clk_init(struct meson_host *host)
 		/* clkin0 hierarchy includes dividers and muxes, and bootloader
 		 * may have left whatever settings. Set to XTAL rate.
 		 */
-		if (i == 0)
-			clk_set_rate(clk, 24000000);
-
 		mux_parent_names[i] = __clk_get_name(clk);
+
+		if(i==0)
+			ret = clk_set_rate(clk, 24000000);  // DEVMFC: from 4.9.180 needed for SC2 and S4
+		if (ret) 
+			return ret;
 	}
 
 	/* create the mux */
@@ -1382,6 +1384,7 @@ static const struct of_device_id meson_mmc_of_match[] = {
 	{ .compatible = "amlogic,meson-gxl-mmc",	.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-gxm-mmc",	.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-axg-mmc",	.data = &meson_axg_data },
+        { .compatible = "amlogic,meson-s4-mmc",		.data = &meson_axg_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, meson_mmc_of_match);
